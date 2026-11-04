@@ -74,13 +74,22 @@ export function validarCorregido(c: ContratoCorregido): void {
 
 // ── Similitud de objeto (RN2, supuesto S8) ──
 
+/** Palabras que no distinguen un objeto de otro: artículos, preposiciones y las fórmulas genéricas de todo contrato. */
 const PALABRAS_VACIAS = new Set([
   "a", "al", "con", "de", "del", "e", "el", "en", "la", "las", "lo", "los", "o", "para", "por", "se", "su", "sus", "u", "un", "una", "y",
+  "contratante", "contratista", "servicio", "parte", "presente", "contrato", "prestacion",
 ]);
 
-/** Tokens de un objeto: minúsculas, sin tildes, sin signos y sin palabras vacías. */
+/** Singular aproximado: «plataformas» → «plataforma», «migraciones» → «migracion». Basta para que el plural no cuente como otra palabra. */
+function singular(t: string): string {
+  if (t.length <= 3) return t;
+  if (/[lnrdzj]es$/.test(t)) return t.slice(0, -2);
+  return t.endsWith("s") ? t.slice(0, -1) : t;
+}
+
+/** Tokens de un objeto: minúsculas, sin tildes, sin signos, en singular y sin palabras vacías. */
 export function tokensObjeto(texto: string): Set<string> {
-  return new Set(normalizar(texto).split(/[^a-z0-9]+/).filter((t) => t && !PALABRAS_VACIAS.has(t)));
+  return new Set(normalizar(texto).split(/[^a-z0-9]+/).filter(Boolean).map(singular).filter((t) => !PALABRAS_VACIAS.has(t)));
 }
 
 /** Similitud de Jaccard entre dos objetos: tokens en común sobre tokens totales, en [0, 1] (RN2). */
@@ -116,6 +125,15 @@ export function camposEnRevision(ext: Extraccion, c: ContratoCorregido): CampoCo
     const corregido = c[k] !== undefined && aTexto(c[k]) !== aTexto(ext.contrato[k].valor);
     return dudoso || corregido;
   });
+}
+
+/**
+ * CA2 al confirmar: campos corregidos que la extracción, sin correcciones, no había puesto en revisión.
+ * La confirmación humana solo cubre lo que se le preguntó; cualquier otro cambio es un valor que no salió de una herramienta.
+ */
+export function correccionesFueraDeRevision(ext: Extraccion, c: ContratoCorregido): CampoConConfianza[] {
+  const enRevision = camposEnRevision(ext, {});
+  return CAMPOS_CON_CONFIANZA.filter((k) => c[k] !== undefined && aTexto(c[k]) !== aTexto(ext.contrato[k].valor) && !enRevision.includes(k));
 }
 
 /** Lo propuesto por la herramienta y lo que queda en cada campo en revisión, para el historial (HU-4). */
@@ -194,6 +212,8 @@ export interface ResultadoClasificacion {
   advertencias: string[];
   /** Fila del maestro que se escribiría; `null` si se rechaza. */
   propuesta: FilaMaestro | null;
+  /** `true` si el mensaje no se marca procesado: queda en el buzón para escalarlo (otrosí sin contrato base). */
+  pendiente?: boolean;
 }
 
 /** Rechazo con motivo y sin propuesta (RN4). */
@@ -201,10 +221,13 @@ export function rechazo(motivo: string, advertencias: string[] = []): ResultadoC
   return { clasificacion: "rechazado", requiere_revision: [], motivo, advertencias, propuesta: null };
 }
 
-/** RN4: un documento sin partes, o un contrato sin objeto, no es registrable. */
-function motivoRN4(v: ValoresFinales, tipo: TipoDocumento): string | null {
-  if (!v.cliente && !v.nit_cliente) return "el documento no identifica a la contraparte (sin partes identificables)";
-  if (tipo === "contrato" && !v.objeto) return "el contrato no tiene un objeto identificable";
+/**
+ * RN4: solo se rechaza un texto sin partes NI objeto identificables. Si falta uno de los dos, el campo
+ * ausente queda en null con confianza 0 y entra a revisión, para no perder un contrato válido (O1).
+ * Un otrosí nunca trae objeto: sin partes se rechaza.
+ */
+function motivoRN4(v: ValoresFinales): string | null {
+  if (!v.cliente && !v.nit_cliente && !v.objeto) return "el documento no identifica a las partes ni el objeto del contrato";
   return null;
 }
 
@@ -247,7 +270,8 @@ function frenteAExistente(v: ValoresFinales, e: EntradaClasificacion, co: Coinci
   if (co.por === "nit_objeto") {
     base.advertencias.push(`Coincide por NIT y objeto (similitud ${co.similitud?.toFixed(2)}) con ${co.fila.id_contrato}.`);
   }
-  if (rn1 && choques.length === 0) return { ...base, clasificacion: "duplicado", requiere_revision: revision, propuesta: co.fila };
+  // RN1: en un duplicado no se escribe nada, así que no hay nada que confirmar.
+  if (rn1 && choques.length === 0) return { ...base, clasificacion: "duplicado", requiere_revision: [], propuesta: co.fila };
   const propuesta = { ...co.fila, ...Object.fromEntries(Object.entries(diferencias).map(([k, d]) => [k, d.despues])) };
   verificarFechas(propuesta);
   return { ...base, clasificacion: "actualizacion", requiere_revision: [...revision, ...choques], diferencias, propuesta };
@@ -262,13 +286,15 @@ export function clasificar(e: EntradaClasificacion): ResultadoClasificacion {
   validarCorregido(e.corregido);
   const tipo = e.extraccion.tipo_documento;
   const v = valoresFinales(e.extraccion, e.corregido);
-  const motivo = motivoRN4(v, tipo);
+  const motivo = motivoRN4(v);
   if (motivo) return rechazo(motivo, e.extraccion.advertencias);
   const revision = camposEnRevision(e.extraccion, e.corregido);
   const co = buscarCoincidencia(v, tipo, e.maestro);
   if (co) return frenteAExistente(v, e, co, revision);
   if (tipo === "otrosi") {
-    return rechazo(`el otrosí modifica el contrato ${v.id_contrato || "sin número"}, que no está en el maestro`, e.extraccion.advertencias);
+    const motivoOtrosi = `el otrosí modifica el contrato ${v.id_contrato || "sin número"}, que no está en el maestro: `
+      + "no se registra ni se marca procesado; queda pendiente en el buzón para escalarlo o esperar el contrato base";
+    return { ...rechazo(motivoOtrosi, e.extraccion.advertencias), pendiente: true };
   }
   const propuesta = filaNueva(v, e);
   verificarFechas(propuesta);

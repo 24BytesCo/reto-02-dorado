@@ -34,14 +34,33 @@ const recortar = (s: string, max: number): string => {
 
 export type TipoDocumento = "contrato" | "otrosi";
 
-/** Un adjunto es contractual si su encabezado es CONTRATO u OTROSÍ y nombra a las partes («Entre…»). */
-export function tipoDocumento(texto: string): TipoDocumento | null {
-  const encabezado = texto.trim().split("\n")[0] ?? "";
-  // `\b` de JavaScript solo conoce letras ASCII: tras la «Í» de «OTROSÍ» nunca hay límite. Se usa \p{L} con la bandera u.
-  if (!/(?<!\p{L})Entre(?!\p{L})/iu.test(texto)) return null;
-  if (/^\s*OTROS[IÍ](?!\p{L})/iu.test(encabezado)) return "otrosi";
-  if (/^\s*CONTRATO(?!\p{L})/iu.test(encabezado)) return "contrato";
+/** Cuántas líneas no vacías se revisan buscando el título: un membrete puede ir antes. */
+const LINEAS_ENCABEZADO = 5;
+
+interface Encabezado {
+  tipo: TipoDocumento;
+  /** Texto desde la línea del título en adelante (sin el membrete). */
+  desdeTitulo: string;
+}
+
+/** Título CONTRATO u OTROSÍ dentro de las primeras líneas no vacías del texto. */
+function encabezado(texto: string): Encabezado | null {
+  const lineas = texto.split("\n");
+  let revisadas = 0;
+  for (let i = 0; i < lineas.length && revisadas < LINEAS_ENCABEZADO; i++) {
+    if (!lineas[i].trim()) continue;
+    revisadas++;
+    // `\b` de JavaScript solo conoce letras ASCII: tras la «Í» de «OTROSÍ» nunca hay límite. Se usa \p{L} con la bandera u.
+    const tipo = /^\s*OTROS[IÍ](?!\p{L})/iu.test(lineas[i]) ? "otrosi" : /^\s*CONTRATO(?!\p{L})/iu.test(lineas[i]) ? "contrato" : null;
+    if (tipo) return { tipo, desdeTitulo: lineas.slice(i).join("\n") };
+  }
   return null;
+}
+
+/** Un adjunto es contractual si en sus primeras líneas se titula CONTRATO u OTROSÍ y nombra a las partes («Entre…»). */
+export function tipoDocumento(texto: string): TipoDocumento | null {
+  if (!/(?<!\p{L})Entre(?!\p{L})/iu.test(texto)) return null;
+  return encabezado(texto)?.tipo ?? null;
 }
 
 /** Describe un adjunto que no es contrato, para el motivo del rechazo (RN4). */
@@ -56,15 +75,24 @@ export function describirNoContractual(texto: string): string {
 const parrafos = (texto: string): string[] =>
   texto.split(/\n\s*\n/).map((p) => p.replace(/\s+/g, " ").trim()).filter(Boolean);
 
+/**
+ * Encabezado de cláusula sobre el texto normalizado: «PRIMERA. OBJETO.», «CLÁUSULA PRIMERA. OBJETO.»,
+ * «PRIMERA: OBJETO DEL CONTRATO.», «1. OBJETO -». `nombre` es una expresión en minúsculas y sin tildes.
+ */
+const patronEncabezado = (nombre: string): RegExp =>
+  new RegExp(`^(?:clausula\\s+)?(?:[a-z]+|\\d+)\\s*[.:\\-–]+\\s*(?:${nombre})(?:\\s+(?:del\\s+contrato|de\\s+ejecucion))?\\s*[.:\\-–]+\\s*`);
+
 /** Párrafo de una cláusula («SEGUNDA. VALOR. …») o de su modificación en un otrosí («cláusula SEGUNDA (VALOR)»). */
 function clausula(texto: string, nombre: string): string | null {
-  const n = normalizar(nombre);
-  return (
-    parrafos(texto).find((p) => {
-      const q = normalizar(p);
-      return new RegExp(`^[a-z]+\\.\\s+${n}\\.`).test(q) || new RegExp(`clausula\\s+\\w+\\s+\\(${n}\\)`).test(q);
-    }) ?? null
-  );
+  const inicio = patronEncabezado(nombre);
+  const modificada = new RegExp(`clausula\\s+\\w+\\s+\\((?:${nombre})\\)`);
+  return parrafos(texto).find((p) => inicio.test(normalizar(p)) || modificada.test(normalizar(p))) ?? null;
+}
+
+/** El párrafo sin su encabezado de cláusula. Normalizar no cambia la longitud de un texto en NFC, así que se corta por posición. */
+function sinEncabezado(parrafo: string, nombre: string): string {
+  const m = normalizar(parrafo.normalize("NFC")).match(patronEncabezado(nombre));
+  return m ? parrafo.normalize("NFC").trim().slice(m[0].length) : parrafo;
 }
 
 // ── Fechas ──
@@ -138,9 +166,10 @@ interface Plazo {
  * fin se deriva (aniversario del inicio) y queda en revisión: se propone, no se afirma.
  */
 function extraerPlazo(texto: string, tipo: TipoDocumento): Plazo {
-  const parrafo = clausula(texto, "PLAZO") ?? "";
+  const parrafo = clausula(texto, "plazo") ?? "";
   const fechas = fechasEn(parrafo);
-  const iDesde = parrafo.search(/\bdesde\b/i);
+  // «a partir del 1 de septiembre» es un inicio explícito; «a partir de la fecha de su firma» se resuelve abajo.
+  const iDesde = parrafo.search(/\bdesde\b|\ba partir del?\s+(?!la fecha)/i);
   const iHasta = parrafo.search(/\bhasta\b/i);
   const inicio = iDesde >= 0 ? fechas.find((f) => f.indice > iDesde && (iHasta < 0 || f.indice < iHasta)) : undefined;
   const fin = iHasta >= 0 ? fechas.find((f) => f.indice > iHasta) : undefined;
@@ -200,26 +229,50 @@ interface ValorExtraido {
   indeterminado: boolean;
 }
 
-/** Valor y moneda desde la cláusula VALOR. Una moneda fuera de la lista del PRD es un error (HU-6). */
+/**
+ * Códigos ISO 4217 que se reconocen como moneda delante de un monto. Los del PRD se aceptan; los demás dan
+ * «moneda desconocida». Cualquier otra sigla de tres letras («IVA») no es una moneda y se ignora.
+ */
+const CODIGOS_ISO = [...MONEDAS, "EUR", "GBP", "BRL", "MXN", "CLP", "ARS", "CAD", "CHF", "JPY", "CNY", "UYU", "BOB", "PYG", "CRC", "GTQ", "NIO", "DOP"];
+const ISO = CODIGOS_ISO.join("|");
+
+/** Monedas fuera del PRD escritas en palabras o con símbolo. */
+const MONEDA_NO_SOPORTADA = /(?<!\p{L})(euros?|libras(?:\s+esterlinas)?|reales)(?!\p{L})|€|£/iu;
+
+const errorMoneda = (moneda: string) => new Error(`moneda desconocida: ${moneda} (se aceptan ${MONEDAS.join(", ")})`);
+
+const indeterminado = (parrafo: string, texto: string, pais: Pais | null): ValorExtraido =>
+  ({ valor: campo(0, 0.5, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: true });
+
+/**
+ * Valor y moneda desde la cláusula VALOR, en este orden: contrato por demanda, monto con código ISO,
+ * moneda no soportada, monto con «$» (moneda implícita), «según las tarifas» sin monto. Moneda fuera del PRD → error (HU-6).
+ */
 function extraerValor(texto: string, pais: Pais | null): ValorExtraido {
-  const parrafo = clausula(texto, "VALOR") ?? "";
-  if (/no tiene (un )?valor determinado|valor indeterminado|por demanda|seg[uú]n las tarifas/i.test(parrafo)) {
-    return { valor: campo(0, 0.5, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: true };
-  }
-  const conCodigo = parrafo.match(/\(\s*([A-Z]{3})\s*\$?\s*([\d][\d.,]*)\s*\)/) ?? parrafo.match(/\b([A-Z]{3})\s*\$?\s*([\d][\d.,]*\d)/);
+  const parrafo = clausula(texto, "valor") ?? "";
+  if (/no tiene (un )?valor determinado|valor indeterminado|por demanda/i.test(parrafo)) return indeterminado(parrafo, texto, pais);
+  const conCodigo = parrafo.match(new RegExp(`\\b(${ISO})\\s*\\$?\\s*(\\d[\\d.,]*\\d|\\d)`));
   if (conCodigo) {
-    if (!esMoneda(conCodigo[1])) throw new Error(`moneda desconocida: ${conCodigo[1]} (se aceptan ${MONEDAS.join(", ")})`);
+    if (!esMoneda(conCodigo[1])) throw errorMoneda(conCodigo[1]);
     return { valor: campo(parsearMonto(conCodigo[2]), 0.95, parrafo), moneda: campo(conCodigo[1], 0.95, parrafo), indeterminado: false };
   }
+  const noSoportada = parrafo.match(MONEDA_NO_SOPORTADA);
+  if (noSoportada) throw errorMoneda(noSoportada[0]);
+  const conSigno = parrafo.match(/\$\s*(\d[\d.,]*\d)/);
+  if (conSigno) return { valor: campo(parsearMonto(conSigno[1]), 0.85, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: false };
+  if (/seg[uú]n las tarifas/i.test(parrafo)) return indeterminado(parrafo, texto, pais);
   return { valor: ausente(), moneda: monedaImplicita(texto, pais), indeterminado: false };
 }
 
-/** Moneda cuando la cláusula de valor no la dice: código o palabra en otra parte del texto, o la del país. */
+/**
+ * Moneda cuando la cláusula de valor no la dice: código o palabra en otra parte del texto (0,85), o la del país
+ * con 0,6, por debajo del umbral: deducirla solo del país es una suposición y va a revisión (O3).
+ */
 function monedaImplicita(texto: string, pais: Pais | null): Campo<Moneda> {
   const codigo = texto.match(/\b(COP|USD|PEN|PAB|HNL)\b/);
   if (codigo && esMoneda(codigo[1])) return campo(codigo[1], 0.85, codigo[0]);
   for (const [patron, moneda] of PALABRAS_MONEDA) if (patron.test(texto)) return campo(moneda, 0.85, moneda);
-  return pais ? campo(MONEDA_POR_PAIS[pais], REGLAS.umbralConfianza, `moneda del país ${pais}`) : ausente();
+  return pais ? campo(MONEDA_POR_PAIS[pais], 0.6, `moneda del país ${pais}`) : ausente();
 }
 
 // ── Partes, identificador y país ──
@@ -231,16 +284,30 @@ interface Parte {
   evidencia: string;
 }
 
-/** Normaliza el identificador: NIT sin puntos ni dígito de verificación; RUC y RTN sin puntos ni espacios. */
+/** Normaliza el identificador: NIT sin puntos ni dígito de verificación; RTN sin puntos, espacios ni guiones; RUC sin puntos ni espacios. */
 export function normalizarIdentificador(tipo: string, crudo: string): string {
+  const t = tipo.toUpperCase();
+  if (t === "RTN") return crudo.replace(/[.\s-]/g, "");
   const sinPuntos = crudo.replace(/[.\s]/g, "");
-  return tipo.toUpperCase() === "NIT" ? sinPuntos.replace(/-\d$/, "") : sinPuntos;
+  return t === "NIT" ? sinPuntos.replace(/-\d$/, "") : sinPuntos;
+}
+
+/**
+ * Supuesto: un RUC con guiones (formato de Panamá, «155612345-2-2017») se compara con el maestro por su primer
+ * segmento, que es como el maestro guarda esos RUC. Si el primer segmento ya está en el maestro se usa ese;
+ * si no, se conserva el RUC completo para no fusionar contribuyentes distintos.
+ */
+function canonizarRuc(parte: Parte, nombrePorId: (id: string) => string | null): Parte {
+  if (parte.tipoId !== "RUC" || !parte.id.includes("-")) return parte;
+  const primero = parte.id.split("-")[0];
+  return nombrePorId(primero) ? { ...parte, id: primero } : parte;
 }
 
 /** La contraparte es la primera parte nombrada cuyo identificador no es el de Periferia. */
 function contraparte(texto: string): Parte | null {
   const plano = texto.replace(/\s+/g, " ");
-  const patron = /(?:Entre|,\s*y)\s+(?:los\s+suscritos,\s*)?([A-ZÁÉÍÓÚÑ][^,]{2,120}?),\s*(?:identificad[ao]\s+con\s+)?(NIT|RUC|RTN)\s*(?:No\.?\s*)?(\d[\d.\-]*\d)/g;
+  // La contraparte puede ir después de Periferia («… (EL CONTRATISTA) y ACME S.A.S., NIT …»), con o sin coma antes de la «y».
+  const patron = /(?:Entre|,?\s+y)\s+(?:los\s+suscritos,\s*)?([A-ZÁÉÍÓÚÑ][^,]{2,120}?),\s*(?:identificad[ao]\s+con\s+(?:el\s+)?|con\s+(?:el\s+)?)?(NIT|RUC|RTN)\s*(?:No\.?\s*)?(\d[\d.\-]*\d)/g;
   for (const m of plano.matchAll(patron)) {
     const id = normalizarIdentificador(m[2], m[3]);
     if (id !== REGLAS.nitPropio) return { nombre: m[1].trim(), tipoId: m[2].toUpperCase(), id, evidencia: m[0] };
@@ -312,10 +379,9 @@ export function slugCliente(cliente: string): string {
 
 /** Objeto sin la fórmula inicial («EL CONTRATISTA prestará servicios de…»), en máximo 200 caracteres (§7.2). */
 function extraerObjeto(texto: string): Campo<string> {
-  const parrafo = clausula(texto, "OBJETO");
+  const parrafo = clausula(texto, "objeto");
   if (!parrafo) return ausente();
-  const cuerpo = parrafo
-    .replace(/^[A-ZÁÉÍÓÚ]+\.\s+OBJETO\.\s*/i, "")
+  const cuerpo = sinEncabezado(parrafo, "objeto")
     .replace(/^EL CONTRATISTA\s+se\s+obliga\s+a\s+(ejecutar\s+)?/i, "")
     .replace(/^EL CONTRATISTA\s+prestar[aá]\s+(el\s+servicio\s+de\s+|los\s+servicios\s+de\s+|servicios\s+de\s+)?/i, "")
     .replace(/^(la|el|los|las)\s+/i, "")
@@ -333,16 +399,35 @@ interface Poliza {
 const slugPoliza = (s: string): string =>
   normalizar(s).replace(/\s+y\s+/g, "_").replace(/\s+sociales$/, "").replace(/\s+/g, "_");
 
-/** Póliza desde la cláusula de GARANTÍAS. Una póliza exigida solo para algunas órdenes no aplica al contrato marco. */
+/** Nombres de la cláusula de garantías: GARANTÍA(S), PÓLIZA(S), SEGUROS, «GARANTÍAS Y SEGUROS». */
+const CLAUSULA_POLIZA = "garantia\\w*(?:\\s+y\\s+seguros)?|poliza\\w*|seguros";
+/** Palabras que indican una póliza exigida en cualquier parte del texto. */
+const MENCION_POLIZA = /p[oó]liza|garant[ií]a\s+(?:[uú]nica|de\s+cumplimiento)/i;
+
+/** Tipos de póliza nombrados en un texto, como lista separada por «;» (§7.2). */
+function tiposPoliza(texto: string): string {
+  const tipos = [...texto.matchAll(/(?:p[oó]lizas?|garant[ií]a\s+[uú]nica)\s+de\s+(cumplimiento|calidad|responsabilidad\s+civil|salarios\s+y\s+prestaciones(?:\s+sociales)?|estabilidad)/gi)]
+    .map((m) => slugPoliza(m[1]));
+  return [...new Set(tipos)].join(";");
+}
+
+/** Sin cláusula de garantías: si el texto nombra una póliza va a revisión (0,6); si no la nombra en ningún lugar, no aplica (0,9). */
+function polizaSinClausula(texto: string): Poliza {
+  const mencion = texto.match(MENCION_POLIZA);
+  if (!mencion) return { requiere_poliza: campo(false, 0.9, "el texto no menciona pólizas ni garantías"), tipo_poliza: campo("", 0.9), advertencias: [] };
+  return {
+    requiere_poliza: campo(true, 0.6, mencion[0]),
+    tipo_poliza: campo(tiposPoliza(texto), 0.6, mencion[0]),
+    advertencias: [`El texto menciona «${mencion[0]}» fuera de una cláusula de garantías: se propone que requiere póliza y se pide revisión.`],
+  };
+}
+
+/** Póliza desde la cláusula de garantías (O4, HU-5). Una póliza exigida solo para algunas órdenes no aplica al contrato marco. */
 function extraerPoliza(texto: string, tipo: TipoDocumento): Poliza {
   if (tipo === "otrosi") return { requiere_poliza: ausente(), tipo_poliza: ausente(), advertencias: [] };
-  const parrafo = clausula(texto, "GARANTÍAS") ?? clausula(texto, "GARANTÍA");
-  if (!parrafo || !/p[oó]liza/i.test(parrafo)) {
-    return { requiere_poliza: campo(false, 0.9, "sin cláusula de garantías"), tipo_poliza: campo("", 0.9), advertencias: [] };
-  }
-  const tipos = [...parrafo.matchAll(/p[oó]lizas?\s+de\s+(cumplimiento|calidad|responsabilidad\s+civil|salarios\s+y\s+prestaciones(?:\s+sociales)?|estabilidad)/gi)]
-    .map((m) => slugPoliza(m[1]));
-  const lista = [...new Set(tipos)].join(";");
+  const parrafo = clausula(texto, CLAUSULA_POLIZA);
+  if (!parrafo || !MENCION_POLIZA.test(parrafo)) return polizaSinClausula(texto);
+  const lista = tiposPoliza(parrafo);
   if (/para cada orden|cuyo valor supere|en caso de que|cuando el valor/i.test(parrafo)) {
     return {
       requiere_poliza: campo(false, REGLAS.umbralConfianza, parrafo),
@@ -356,13 +441,15 @@ function extraerPoliza(texto: string, tipo: TipoDocumento): Poliza {
 // ── Identificador del contrato ──
 
 const PATRON_ID = /([A-Z]{2,4}-\d{4}-\d{1,4})/;
+/** «No.», «No», «N°», «Nº». */
+const NUMERO = "N(?:o|°|º)\\.?";
 
-/** Número del contrato; en un otrosí, el del contrato que modifica («AL CONTRATO … No. XX-AAAA-NNN»). */
+/** Número del contrato desde su título (después de un posible membrete); en un otrosí, el del contrato que modifica. */
 function extraerId(texto: string, tipo: TipoDocumento): Campo<string> {
-  const plano = texto.replace(/\s+/g, " ");
+  const plano = (encabezado(texto)?.desdeTitulo ?? texto).replace(/\s+/g, " ");
   const patron = tipo === "otrosi"
-    ? new RegExp(`AL\\s+CONTRATO[^.]*?No\\.?\\s*${PATRON_ID.source}`, "i")
-    : new RegExp(`^\\s*CONTRATO[^.]*?No\\.?\\s*${PATRON_ID.source}`, "i");
+    ? new RegExp(`AL\\s+CONTRATO[^.]*?${NUMERO}\\s*${PATRON_ID.source}`, "i")
+    : new RegExp(`^\\s*CONTRATO[^.]*?${NUMERO}\\s*${PATRON_ID.source}`, "i");
   const m = plano.match(patron);
   return m ? campo(m[1], 0.95, m[0]) : ausente();
 }
@@ -401,12 +488,13 @@ export function extraerContrato(texto: string, nombrePorId: (id: string) => stri
   if (!texto.trim()) throw new Error("el adjunto está vacío");
   const tipo = tipoDocumento(texto);
   if (!tipo) throw new Error(describirNoContractual(texto));
-  const parte = contraparte(texto);
+  const encontrada = contraparte(texto);
+  const parte = encontrada ? canonizarRuc(encontrada, nombrePorId) : null;
   const pais = parte ? extraerPais(texto, parte) : ausente<Pais>();
   const plazo = extraerPlazo(texto, tipo);
   const valor = extraerValor(texto, pais.valor);
   const poliza = extraerPoliza(texto, tipo);
-  const numero = texto.match(/OTROS[IÍ]\s+No\.?\s*(\d+)/i);
+  const numero = texto.match(new RegExp(`OTROS[IÍ]\\s+${NUMERO}\\s*(\\d+)`, "i"));
   return {
     tipo_documento: tipo,
     numero_otrosi: tipo === "otrosi" && numero ? Number(numero[1]) : null,

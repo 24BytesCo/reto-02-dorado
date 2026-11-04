@@ -153,12 +153,21 @@ test("un otrosí de un contrato que no está en el maestro se rechaza con motivo
   assert.match(r.motivo!, /no está en el maestro/);
 });
 
-test("RN4: un contrato sin objeto identificable se rechaza", () => {
+test("RN4: un contrato con partes pero sin objeto no se rechaza: el objeto entra a revisión", () => {
   const ext = extraccionDeMensaje(proyectoTemporal(), "msg-001");
   const sinObjeto = { ...ext, contrato: { ...ext.contrato, objeto: { valor: null, confianza: 0 } } };
   const r = clasificar({ extraccion: sinObjeto, corregido: {}, comercial: "", fecha_registro: "2026-08-04", maestro: [] });
+  assert.equal(r.clasificacion, "nuevo");
+  assert.deepEqual(r.requiere_revision, ["objeto"]);
+});
+
+test("RN4: sin partes ni objeto sí se rechaza", () => {
+  const ext = extraccionDeMensaje(proyectoTemporal(), "msg-001");
+  const nulo = { valor: null, confianza: 0 };
+  const vacio = { ...ext, contrato: { ...ext.contrato, objeto: nulo, cliente: nulo, nit_cliente: nulo } };
+  const r = clasificar({ extraccion: vacio, corregido: {}, comercial: "", fecha_registro: "2026-08-04", maestro: [] });
   assert.equal(r.clasificacion, "rechazado");
-  assert.match(r.motivo!, /objeto/);
+  assert.match(r.motivo!, /partes ni el objeto/);
 });
 
 test("§7.2: un contrato sin número recibe AUTO-<año>-<secuencia> y el id queda en revisión", () => {

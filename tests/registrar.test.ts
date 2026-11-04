@@ -24,8 +24,9 @@ test("msg-001 (HU-4): inserta la fila con la ruta, archiva el contrato, anota el
   assert.equal(fila(ctx, "CT-2026-015")?.estado_poliza, "pendiente");
   assert.ok(archivado(ctx, ruta));
   const [h] = historial(ctx);
-  assert.deepEqual(Object.keys(h), ["ts", "id_contrato", "accion", "cambios", "mensaje_id"]);
-  assert.equal(h.cambios.valor, "265000000");
+  assert.deepEqual(Object.keys(h), ["ts", "id_contrato", "accion", "cambios", "mensaje_id", "archivo"]);
+  assert.deepEqual(h.cambios.valor, { antes: null, despues: "265000000" });
+  assert.equal(h.archivo, ruta);
   assert.equal(leerProcesados(ctx)["msg-001"].accion, "nuevo");
 });
 
@@ -95,18 +96,20 @@ test("msg-006 confirmado: queda registrado con los valores confirmados y el hist
   assert.equal(r.data.ruta_archivo, "Contratos/2026/distribuidora-caribe/CM-2026-03.txt");
   const f = fila(ctx, "CM-2026-03");
   assert.deepEqual([f?.valor, f?.fecha_fin, f?.comercial], ["0", "2027-08-31", ""]);
-  assert.deepEqual(historial(ctx)[0].cambios.confirmados, {
+  assert.deepEqual(historial(ctx)[0].confirmados, {
     valor: { propuesto: "0", confirmado: "0" },
     fecha_fin: { propuesto: "2027-08-31", confirmado: "2027-08-31" },
   });
 });
 
-test("CA2: un valor que no salió de la herramienta no entra sin confirmación", async () => {
+test("CA2: un valor que no salió de la herramienta no entra, ni sin confirmación ni confirmado", async () => {
   const ctx = proyectoTemporal();
   assert.deepEqual(await registrarEn(ctx, "msg-001", { valor: 999 }), { ok: false, error: "requiere revisión: valor" });
+  assert.deepEqual(await registrarEn(ctx, "msg-001", { valor: 999 }, true), {
+    ok: false, error: "el campo valor no estaba en revisión: no se puede cambiar al confirmar; valida de nuevo y pide confirmación",
+  });
   assert.equal(fila(ctx, "CT-2026-015"), undefined);
-  await registrarEn(ctx, "msg-001", { valor: 999 }, true);
-  assert.deepEqual(historial(ctx)[0].cambios.confirmados, { valor: { propuesto: "265000000", confirmado: "999" } });
+  assert.ok(!("msg-001" in leerProcesados(ctx)));
 });
 
 test("idempotencia (O2): registrar dos veces msg-001 no duplica la fila; la segunda vez es duplicado", async () => {

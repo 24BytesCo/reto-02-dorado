@@ -1,9 +1,15 @@
-import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
-import { ok, seguro, type Contexto, type Herramienta } from "./nucleo.ts";
-import { leerComerciales, leerCorreo, leerMaestro, leerProcesados, listarMensajes, rutaAdjunto, type Correo } from "./almacen.ts";
-import { CAMPOS_CON_CONFIANZA, REGLAS } from "./reglas.ts";
-import { describirNoContractual, extraerContrato, tipoDocumento, type Campo, type Extraccion } from "./extraccion.ts";
+import { fallo, ok, seguro, type Contexto, type Herramienta } from "./nucleo.ts";
+import {
+  anotarHistorial, archivar, escribirMaestro, leerCorreo, leerMaestro, leerProcesados, listarMensajes, marcarProcesado, rutaAdjunto,
+} from "./almacen.ts";
+import { CAMPOS_CON_CONFIANZA, REGLAS, type FilaMaestro } from "./reglas.ts";
+import { slugCliente } from "./extraccion.ts";
+import { adjuntoContractual, extraccionDeMensaje, motivoSinContrato, type ExtraccionMensaje } from "./mensajes.ts";
+import {
+  clasificar, confirmadosDe, esquemaContratoCorregido, rechazo, validarCorregido, type ContratoCorregido, type ResultadoClasificacion,
+} from "./clasificacion.ts";
 
 /**
  * Herramientas del agente de registro de contratos (PRD §6.2).
@@ -12,79 +18,6 @@ import { describirNoContractual, extraerContrato, tipoDocumento, type Campo, typ
 
 const mensajeId = z.string().regex(/^[\w-]+$/).describe("Id del mensaje del buzón, tal como lo devuelve contratos_leer_buzon");
 
-/** Texto del primer adjunto contractual del correo, o `null` si no trae ninguno. */
-function adjuntoContractual(ctx: Contexto, correo: Correo): { nombre: string; ruta: string; texto: string } | null {
-  for (const nombre of correo.adjuntos) {
-    const ruta = rutaAdjunto(ctx, correo.id, nombre);
-    if (!fs.existsSync(ruta)) continue;
-    const texto = fs.readFileSync(ruta, "utf8");
-    if (tipoDocumento(texto)) return { nombre, ruta, texto };
-  }
-  return null;
-}
-
-/** Motivo de rechazo de un correo sin documento contractual (RN4). */
-function motivoSinContrato(ctx: Contexto, correo: Correo): string {
-  if (correo.adjuntos.length === 0) return "el correo no trae adjuntos";
-  const ruta = rutaAdjunto(ctx, correo.id, correo.adjuntos[0]);
-  return fs.existsSync(ruta) ? describirNoContractual(fs.readFileSync(ruta, "utf8")) : `no se encontró el adjunto ${correo.adjuntos[0]}`;
-}
-
-/** Nombre del cliente en el maestro para un identificador tributario, si ya existe. */
-function nombrePorIdentificador(ctx: Contexto): (id: string) => string | null {
-  const filas = leerMaestro(ctx);
-  return (id) => filas.find((f) => f.nit_cliente === id)?.cliente ?? null;
-}
-
-/** Resultado completo de extraer un mensaje: datos del texto más los que salen del correo. */
-export interface ExtraccionMensaje extends Extraccion {
-  mensaje_id: string;
-  adjunto: string;
-  contrato: Extraccion["contrato"] & {
-    estado_poliza: Campo<string>;
-    comercial: Campo<string>;
-    fecha_registro: Campo<string>;
-    fuente: Campo<string>;
-  };
-}
-
-/** Comercial resuelto contra `comerciales.json`; un remitente desconocido se reporta pero no bloquea (HU-3). */
-function resolverComercial(ctx: Contexto, remitente: string): { comercial: Campo<string>; advertencia: string | null } {
-  const encontrado = leerComerciales(ctx).find((c) => c.email.toLowerCase() === remitente.toLowerCase());
-  if (encontrado) return { comercial: { valor: encontrado.nombre, confianza: 1, evidencia: remitente }, advertencia: null };
-  return {
-    comercial: { valor: null, confianza: 0, evidencia: remitente },
-    advertencia: `El remitente ${remitente} no está en el catálogo de comerciales: se reporta y el registro sigue; el campo comercial queda vacío.`,
-  };
-}
-
-/**
- * Extrae un mensaje del buzón (HU-2): datos del adjunto con su confianza, más comercial,
- * fecha de recepción como fecha de registro, fuente y el estado de póliza que corresponde a un registro nuevo.
- * @throws Error legible si el mensaje no trae un documento contractual o el texto es inválido (HU-6).
- */
-export function extraccionDeMensaje(ctx: Contexto, mensaje_id: string): ExtraccionMensaje {
-  const correo = leerCorreo(ctx, mensaje_id);
-  const adjunto = adjuntoContractual(ctx, correo);
-  if (!adjunto) throw new Error(`${mensaje_id} no trae contrato: ${motivoSinContrato(ctx, correo)}`);
-  const ext = extraerContrato(adjunto.texto, nombrePorIdentificador(ctx));
-  const { comercial, advertencia } = resolverComercial(ctx, correo.de);
-  const requiere = ext.contrato.requiere_poliza;
-  const estado = requiere.valor === null ? null : requiere.valor ? "pendiente" : "no_aplica";
-  return {
-    ...ext,
-    mensaje_id,
-    adjunto: adjunto.nombre,
-    contrato: {
-      ...ext.contrato,
-      estado_poliza: { valor: estado, confianza: requiere.confianza },
-      comercial,
-      fecha_registro: { valor: correo.fecha.slice(0, 10), confianza: 1, evidencia: `fecha del correo ${correo.fecha}` },
-      fuente: { valor: "buzon", confianza: 1 },
-    },
-    advertencias: advertencia ? [...ext.advertencias, advertencia] : ext.advertencias,
-  };
-}
 
 /** HU-2: datos estructurados del contrato adjunto, con confianza por campo. */
 export const extraer: Herramienta<{ mensaje_id: typeof mensajeId }> = {
@@ -117,3 +50,119 @@ export const leer_buzon: Herramienta<{}> = {
     }),
 };
 
+
+// ── HU-3 validar y HU-4 registrar ──
+
+const contrato = esquemaContratoCorregido
+  .optional()
+  .describe("Valores corregidos por la analista, planos y opcionales; lo omitido toma lo extraído por contratos_extraer");
+
+/** Clasificación de un mensaje más lo que `registrar` necesita para escribir. */
+interface Evaluacion {
+  resultado: ResultadoClasificacion;
+  extraccion: ExtraccionMensaje | null;
+}
+
+/**
+ * Revalida un mensaje desde el buzón: RN4 si no trae documento contractual; si lo trae, extrae y clasifica
+ * contra la copia del maestro (RN1-RN5). `validar` y `registrar` la comparten: ninguna confía en el modelo.
+ */
+function evaluar(ctx: Contexto, mensaje_id: string, corregido: ContratoCorregido): Evaluacion {
+  validarCorregido(corregido);
+  const correo = leerCorreo(ctx, mensaje_id);
+  if (!adjuntoContractual(ctx, correo)) return { resultado: rechazo(motivoSinContrato(ctx, correo)), extraccion: null };
+  const extraccion = extraccionDeMensaje(ctx, mensaje_id);
+  const resultado = clasificar({
+    extraccion,
+    corregido,
+    comercial: extraccion.contrato.comercial.valor ?? "",
+    fecha_registro: extraccion.contrato.fecha_registro.valor ?? correo.fecha.slice(0, 10),
+    maestro: leerMaestro(ctx),
+  });
+  return { resultado, extraccion };
+}
+
+/** Id del contrato al que se refiere el resultado: el existente, el propuesto o ninguno. */
+const idDe = (r: ResultadoClasificacion): string | null => r.id_contrato_existente ?? (r.propuesta?.id_contrato || null);
+
+/** HU-3: clasifica un mensaje en nuevo, actualización, duplicado o rechazado y lista lo que requiere revisión. */
+export const validar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: typeof contrato }> = {
+  description: "Clasifica el contrato de un mensaje como nuevo, actualizacion, duplicado o rechazado frente al maestro, con los campos que requieren revisión humana y la fila que se escribiría; no escribe nada.",
+  args: { mensaje_id: mensajeId, contrato },
+  execute: ({ mensaje_id, contrato: corregido }, ctx) =>
+    seguro(() => {
+      const { resultado: r } = evaluar(ctx, mensaje_id, corregido ?? {});
+      const sobre = r.id_contrato_existente ? ` sobre ${r.id_contrato_existente}` : "";
+      const resumen = `${mensaje_id}: ${r.clasificacion}${sobre}; revisión: ${r.requiere_revision.join(", ") || "ninguna"}`;
+      return ok({ mensaje_id, ...r, resumen });
+    }),
+};
+
+/** Ruta relativa en SharePoint: `Contratos/<año_inicio>/<cliente-slug>/<nombre>.<ext>` (HU-4). */
+function rutaContrato(fila: FilaMaestro, nombre: string, adjunto: string): string {
+  const anio = (fila.fecha_inicio || fila.fecha_registro).slice(0, 4);
+  return path.posix.join("Contratos", anio, slugCliente(fila.cliente) || "sin-cliente", `${nombre}${path.extname(adjunto)}`);
+}
+
+/** Datos de un registro confirmado: lo propuesto y lo que quedó en cada campo en revisión (CA2). */
+function conConfirmados(ext: ExtraccionMensaje, r: ResultadoClasificacion, fila: FilaMaestro, base: object): object {
+  const confirmados = confirmadosDe(ext, r.requiere_revision, fila);
+  return Object.keys(confirmados).length > 0 ? { ...base, confirmados } : base;
+}
+
+/** RN3: inserta la fila, archiva el contrato, guarda la ruta y anota el historial con la fila completa. */
+function registrarNuevo(ctx: Contexto, mensaje_id: string, ext: ExtraccionMensaje, r: ResultadoClasificacion, propuesta: FilaMaestro) {
+  const ruta = rutaContrato(propuesta, propuesta.id_contrato, ext.adjunto);
+  const fila = { ...propuesta, ruta_sharepoint: ruta };
+  archivar(ctx, rutaAdjunto(ctx, mensaje_id, ext.adjunto), ruta);
+  escribirMaestro(ctx, [...leerMaestro(ctx), fila]);
+  anotarHistorial(ctx, { id_contrato: fila.id_contrato, accion: "nuevo", cambios: conConfirmados(ext, r, fila, fila), mensaje_id });
+  return { id_contrato: fila.id_contrato, accion: "nuevo" as const, ruta_archivo: ruta };
+}
+
+/**
+ * RN2: modifica la fila existente (nunca agrega otra) y archiva el documento sin pisar el original:
+ * un otrosí como `<id>-otrosi-<n>` (supuesto S11); la fila conserva su ruta.
+ */
+function registrarActualizacion(ctx: Contexto, mensaje_id: string, ext: ExtraccionMensaje, r: ResultadoClasificacion, propuesta: FilaMaestro) {
+  const id = propuesta.id_contrato;
+  const nombre = ext.tipo_documento === "otrosi" ? `${id}-otrosi-${ext.numero_otrosi ?? 1}` : `${id}-${mensaje_id}`;
+  const ruta = archivar(ctx, rutaAdjunto(ctx, mensaje_id, ext.adjunto), rutaContrato(propuesta, nombre, ext.adjunto));
+  escribirMaestro(ctx, leerMaestro(ctx).map((f) => (f.id_contrato === r.id_contrato_existente ? propuesta : f)));
+  const cambios = conConfirmados(ext, r, propuesta, { ...r.diferencias, archivo: ruta });
+  anotarHistorial(ctx, { id_contrato: id, accion: "actualizacion", cambios, mensaje_id });
+  return { id_contrato: id, accion: "actualizacion" as const, ruta_archivo: ruta };
+}
+
+/** Escribe según la clasificación; duplicados y rechazados no tocan maestro, historial ni archivo (RN1, RN4). */
+function escribir(ctx: Contexto, mensaje_id: string, ev: Evaluacion) {
+  const r = ev.resultado;
+  if (ev.extraccion && r.propuesta && r.clasificacion === "nuevo") return registrarNuevo(ctx, mensaje_id, ev.extraccion, r, r.propuesta);
+  if (ev.extraccion && r.propuesta && r.clasificacion === "actualizacion") {
+    return registrarActualizacion(ctx, mensaje_id, ev.extraccion, r, r.propuesta);
+  }
+  return { id_contrato: idDe(r), accion: r.clasificacion, ruta_archivo: null, ...(r.motivo ? { motivo: r.motivo } : {}) };
+}
+
+/**
+ * HU-4: revalida el mensaje y, si no hay campos en revisión o viene `confirmado: true` (RN5), escribe el maestro,
+ * archiva el documento, anota el historial y marca el mensaje como procesado. Es idempotente: repetirlo da duplicado.
+ */
+export const registrar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: typeof contrato; confirmado: z.ZodOptional<z.ZodBoolean> }> = {
+  description: "Registra el contrato de un mensaje en el maestro y lo archiva tras revalidarlo; si hay campos en revisión exige confirmado: true, y los duplicados y rechazados solo quedan marcados como procesados.",
+  args: {
+    mensaje_id: mensajeId,
+    contrato,
+    confirmado: z.boolean().optional().describe("true solo si la analista confirmó en un mensaje propio los campos en revisión"),
+  },
+  execute: ({ mensaje_id, contrato: corregido, confirmado }, ctx) =>
+    seguro(() => {
+      const ev = evaluar(ctx, mensaje_id, corregido ?? {});
+      const revision = ev.resultado.requiere_revision;
+      if (revision.length > 0 && confirmado !== true) return fallo(`requiere revisión: ${revision.join(", ")}`);
+      const hecho = escribir(ctx, mensaje_id, ev);
+      marcarProcesado(ctx, mensaje_id, hecho.accion, hecho.id_contrato);
+      const resumen = `${mensaje_id}: ${hecho.accion} ${hecho.id_contrato ?? "sin id"}; ${hecho.ruta_archivo ?? "sin escritura"}`;
+      return ok({ ...hecho, resumen });
+    }),
+};

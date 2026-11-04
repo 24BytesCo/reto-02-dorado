@@ -58,6 +58,6 @@ demo.ts                             herramientas sin modelo
 17. Tope de iteraciones por turno, tope de tokens por sesión y timeout al proveedor, configurables.
 
 ### Proceso
-18. **Una tarea de `tasks.md` = un issue = un commit** («Cierra #n»), en español: `#Título` y viñetas.
+18. **Una tarea de `tasks.md` = un issue = un commit** («Cierra #n»), en español: `#Título` y viñetas. Las tareas y sus issues se titulan `T<fase>.<n> | <pieza>: <qué hace>` (por ejemplo, `T1.4 | contratos_extraer: extracción determinista con confianza por campo`); el issue se cierra con un comentario que enlaza el commit.
 19. Antes de cada commit: `npm run typecheck && npm test && npm run demo`.
 20. Cada regla de negocio (RN1-RN7) y cada correo del buzón (§7.4) tiene al menos una prueba.

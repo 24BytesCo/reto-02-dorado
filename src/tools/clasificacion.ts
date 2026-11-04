@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { normalizar, fechaIso, type Extraccion, type TipoDocumento } from "./extraccion.ts";
+import { esModificacion, normalizar, fechaIso, type Extraccion, type TipoDocumento } from "./extraccion.ts";
 import { CAMPOS_CON_CONFIANZA, MONEDAS, PAISES, REGLAS, type CampoConConfianza, type FilaMaestro } from "./reglas.ts";
 
 /**
@@ -115,11 +115,11 @@ function valoresFinales(ext: Extraccion, c: ContratoCorregido): ValoresFinales {
 }
 
 /**
- * Campos que exigen confirmación humana (RN5, CA2): confianza < umbral (en un otrosí, solo los que trae)
+ * Campos que exigen confirmación humana (RN5, CA2): confianza < umbral (en un otrosí o un acta, solo los que trae)
  * y todo valor corregido que difiera de lo extraído, porque no salió de una herramienta.
  */
 export function camposEnRevision(ext: Extraccion, c: ContratoCorregido): CampoConConfianza[] {
-  const evaluables = ext.tipo_documento === "otrosi" ? camposTraidos(ext, c) : CAMPOS_CON_CONFIANZA;
+  const evaluables = esModificacion(ext.tipo_documento) ? camposTraidos(ext, c) : CAMPOS_CON_CONFIANZA;
   return CAMPOS_CON_CONFIANZA.filter((k) => {
     const dudoso = evaluables.includes(k) && ext.contrato[k].confianza < REGLAS.umbralConfianza;
     const corregido = c[k] !== undefined && aTexto(c[k]) !== aTexto(ext.contrato[k].valor);
@@ -157,7 +157,7 @@ interface Coincidencia {
 function buscarCoincidencia(v: ValoresFinales, tipo: TipoDocumento, maestro: FilaMaestro[]): Coincidencia | null {
   const porId = v.id_contrato ? maestro.find((f) => f.id_contrato === v.id_contrato) : undefined;
   if (porId) return { fila: porId, por: "id" };
-  if (tipo === "otrosi" || !v.nit_cliente || !v.objeto) return null;
+  if (esModificacion(tipo) || !v.nit_cliente || !v.objeto) return null;
   for (const fila of maestro.filter((f) => f.nit_cliente === v.nit_cliente)) {
     const similitud = similitudObjeto(fila.objeto, v.objeto);
     if (similitud >= REGLAS.similitudObjeto) return { fila, por: "nit_objeto", similitud };
@@ -165,10 +165,9 @@ function buscarCoincidencia(v: ValoresFinales, tipo: TipoDocumento, maestro: Fil
   return null;
 }
 
-/** Choques de identidad con la fila encontrada (S5): otro NIT, otra moneda u otro id para el mismo contrato. */
+/** Choques de identidad con la fila encontrada (S5): otro NIT u otra moneda. Otro id con mismo NIT y objeto es una renovación. */
 function conflictos(v: ValoresFinales, co: Coincidencia): string[] {
   const lista: string[] = [];
-  if (co.por === "nit_objeto" && v.id_contrato && v.id_contrato !== co.fila.id_contrato) lista.push("conflicto: id_contrato");
   for (const k of ["nit_cliente", "moneda"] as const) {
     if (v[k] && co.fila[k] && v[k] !== co.fila[k]) lista.push(`conflicto: ${k}`);
   }
@@ -259,13 +258,24 @@ function verificarFechas(fila: FilaMaestro): void {
   }
 }
 
-/** RN1 o RN2 frente a una fila existente; un otrosí sin cambios es un duplicado (reaplicarlo no escribe). */
+/**
+ * S2: el id ya es de otro cliente. Pisar la fila borraría un contrato ajeno, así que no hay propuesta ni confirmación
+ * que lo permita: queda pendiente en el buzón (no se marca procesado) hasta que la analista corrija el id o lo escale.
+ */
+function idDeOtroCliente(v: ValoresFinales, e: EntradaClasificacion, co: Coincidencia): ResultadoClasificacion {
+  const motivo = `el id ${co.fila.id_contrato} ya pertenece a ${co.fila.cliente} (NIT ${co.fila.nit_cliente}) y el documento es de NIT ${v.nit_cliente}: `
+    + "no se puede sobrescribir ni confirmando; corrige id_contrato si es otro contrato o escálalo. Queda pendiente en el buzón";
+  return { ...rechazo(motivo, e.extraccion.advertencias), id_contrato_existente: co.fila.id_contrato, pendiente: true };
+}
+
+/** RN1 o RN2 frente a una fila existente; un otrosí o acta sin cambios es un duplicado (reaplicarlo no escribe). */
 function frenteAExistente(v: ValoresFinales, e: EntradaClasificacion, co: Coincidencia, revision: string[]): ResultadoClasificacion {
   const choques = conflictos(v, co);
+  if (choques.includes("conflicto: nit_cliente")) return idDeOtroCliente(v, e, co);
   const diferencias = calcularDiferencias(co.fila, v, camposTraidos(e.extraccion, e.corregido));
   const mismasFechasYValor = (["valor", "fecha_inicio", "fecha_fin"] as const).every((k) => v[k] === co.fila[k]);
   const sinCambios = Object.keys(diferencias).length === 0;
-  const rn1 = e.extraccion.tipo_documento === "otrosi" ? sinCambios : mismasFechasYValor || sinCambios;
+  const rn1 = esModificacion(e.extraccion.tipo_documento) ? sinCambios : mismasFechasYValor || sinCambios;
   const base = { id_contrato_existente: co.fila.id_contrato, advertencias: [...e.extraccion.advertencias] };
   if (co.por === "nit_objeto") {
     base.advertencias.push(`Coincide por NIT y objeto (similitud ${co.similitud?.toFixed(2)}) con ${co.fila.id_contrato}.`);
@@ -275,6 +285,38 @@ function frenteAExistente(v: ValoresFinales, e: EntradaClasificacion, co: Coinci
   const propuesta = { ...co.fila, ...Object.fromEntries(Object.entries(diferencias).map(([k, d]) => [k, d.despues])) };
   verificarFechas(propuesta);
   return { ...base, clasificacion: "actualizacion", requiere_revision: [...revision, ...choques], diferencias, propuesta };
+}
+
+/** Un otrosí o un acta sin contrato base no se registra ni se marca procesado: queda en el buzón para escalarlo. */
+function modificacionSinBase(v: ValoresFinales, e: EntradaClasificacion): ResultadoClasificacion {
+  const documento = e.extraccion.tipo_documento === "acta" ? "el acta de terminación" : "el otrosí";
+  const motivo = `${documento} modifica el contrato ${v.id_contrato || "sin número"}, que no está en el maestro: `
+    + "no se registra ni se marca procesado; queda pendiente en el buzón para escalarlo o esperar el contrato base";
+  return { ...rechazo(motivo, e.extraccion.advertencias), pendiente: true };
+}
+
+/**
+ * S2: mismo NIT y objeto similar pero otro número de contrato explícito es otro contrato (una renovación), no una
+ * actualización del existente: se clasifica como nuevo y se advierte, para no pisar la fila vigente.
+ */
+function esRenovacion(v: ValoresFinales, co: Coincidencia): boolean {
+  return co.por === "nit_objeto" && Boolean(v.id_contrato) && v.id_contrato !== co.fila.id_contrato;
+}
+
+/** RN3: fila nueva con sus campos en revisión y las advertencias de la extracción. */
+function clasificarNuevo(v: ValoresFinales, e: EntradaClasificacion, revision: string[], advertencias: string[]): ResultadoClasificacion {
+  const propuesta = filaNueva(v, e);
+  verificarFechas(propuesta);
+  return { clasificacion: "nuevo", requiere_revision: revision, advertencias, propuesta };
+}
+
+/**
+ * Campos en revisión más «firma» cuando el documento parece no firmado (regla de gobierno): un borrador o una
+ * propuesta no se registra sin que la analista confirme que es la versión firmada.
+ */
+function revisionDe(e: EntradaClasificacion): string[] {
+  const campos: string[] = camposEnRevision(e.extraccion, e.corregido);
+  return e.extraccion.sin_firma ? [...campos, "firma"] : campos;
 }
 
 /**
@@ -288,15 +330,13 @@ export function clasificar(e: EntradaClasificacion): ResultadoClasificacion {
   const v = valoresFinales(e.extraccion, e.corregido);
   const motivo = motivoRN4(v);
   if (motivo) return rechazo(motivo, e.extraccion.advertencias);
-  const revision = camposEnRevision(e.extraccion, e.corregido);
+  const revision = revisionDe(e);
   const co = buscarCoincidencia(v, tipo, e.maestro);
-  if (co) return frenteAExistente(v, e, co, revision);
-  if (tipo === "otrosi") {
-    const motivoOtrosi = `el otrosí modifica el contrato ${v.id_contrato || "sin número"}, que no está en el maestro: `
-      + "no se registra ni se marca procesado; queda pendiente en el buzón para escalarlo o esperar el contrato base";
-    return { ...rechazo(motivoOtrosi, e.extraccion.advertencias), pendiente: true };
+  if (co && esRenovacion(v, co)) {
+    const aviso = `Posible renovación de ${co.fila.id_contrato}: mismo NIT y objeto similar (${co.similitud?.toFixed(2)}) con otro número; se registra como contrato nuevo.`;
+    return clasificarNuevo(v, e, revision, [...e.extraccion.advertencias, aviso]);
   }
-  const propuesta = filaNueva(v, e);
-  verificarFechas(propuesta);
-  return { clasificacion: "nuevo", requiere_revision: revision, advertencias: e.extraccion.advertencias, propuesta };
+  if (co) return frenteAExistente(v, e, co, revision);
+  if (esModificacion(tipo)) return modificacionSinBase(v, e);
+  return clasificarNuevo(v, e, revision, e.extraccion.advertencias);
 }

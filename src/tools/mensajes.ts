@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { leerComerciales, leerCorreo, leerMaestro, rutaAdjunto, type Correo } from "./almacen.ts";
-import { describirNoContractual, extraerContrato, tipoDocumento, type Campo, type Extraccion } from "./extraccion.ts";
+import { describirNoContractual, extraerContrato, fechaIso, tipoDocumento, type Campo, type Extraccion } from "./extraccion.ts";
 import type { Contexto } from "./nucleo.ts";
 
 /**
@@ -74,9 +74,27 @@ function resolverComercial(ctx: Contexto, remitente: string): { comercial: Campo
 }
 
 /**
+ * Fecha de registro (supuesto S9) desde la fecha del correo: ISO («2026-08-04T09:15:00-05:00») o DD/MM/AAAA
+ * («03/09/2026 10:15»), siempre validada como fecha real. Una fecha que no se entiende no entra al maestro:
+ * rompería «registrados desde el corte» (HU-5).
+ * @throws Error legible con la fecha recibida (HU-6).
+ */
+export function fechaRegistro(fecha: string): string {
+  const iso = fecha.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s]|$)/);
+  const dma = fecha.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s|$)/);
+  const partes = iso ? [iso[1], iso[2], iso[3]] : dma ? [dma[3], dma[2], dma[1]] : null;
+  if (!partes) throw new Error(`la fecha del correo «${fecha}» no es válida (se espera YYYY-MM-DD o DD/MM/AAAA)`);
+  try {
+    return fechaIso(Number(partes[0]), Number(partes[1]), Number(partes[2]));
+  } catch {
+    throw new Error(`la fecha del correo «${fecha}» no existe en el calendario`);
+  }
+}
+
+/**
  * Extrae un mensaje del buzón (HU-2): datos del adjunto con su confianza, más comercial,
  * fecha de recepción como fecha de registro, fuente y el estado de póliza que corresponde a un registro nuevo.
- * @throws Error legible si el mensaje no trae un documento contractual o el texto es inválido (HU-6).
+ * @throws Error legible si el mensaje no trae un documento contractual, el texto es inválido o la fecha del correo no se entiende (HU-6).
  */
 export function extraccionDeMensaje(ctx: Contexto, mensaje_id: string): ExtraccionMensaje {
   const correo = leerCorreo(ctx, mensaje_id);
@@ -94,7 +112,7 @@ export function extraccionDeMensaje(ctx: Contexto, mensaje_id: string): Extracci
       ...ext.contrato,
       estado_poliza: { valor: estado, confianza: requiere.confianza },
       comercial,
-      fecha_registro: { valor: correo.fecha.slice(0, 10), confianza: 1, evidencia: `fecha del correo ${correo.fecha}` },
+      fecha_registro: { valor: fechaRegistro(correo.fecha), confianza: 1, evidencia: `fecha del correo ${correo.fecha}` },
       fuente: { valor: "buzon", confianza: 1 },
     },
     advertencias: advertencia ? [...ext.advertencias, advertencia] : ext.advertencias,

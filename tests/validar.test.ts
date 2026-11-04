@@ -91,10 +91,10 @@ test("los valores corregidos iguales a lo extraído no agregan revisión", async
   assert.deepEqual((await validarDe("msg-001", { moneda: "COP" })).data.requiere_revision, []);
 });
 
-test("conflicto de identidad: mismo id con otro NIT es actualización con «conflicto: nit_cliente» en revisión", async () => {
+test("S2: mismo id con otro NIT no tiene propuesta: no se puede pisar la fila ni confirmando y queda pendiente", async () => {
   const d = (await validarDe("msg-004", { nit_cliente: "123456789" })).data;
-  assert.equal(d.clasificacion, "actualizacion");
-  assert.deepEqual(d.requiere_revision, ["nit_cliente", "conflicto: nit_cliente"]);
+  assert.deepEqual([d.clasificacion, d.propuesta, d.pendiente, d.id_contrato_existente], ["rechazado", null, true, "CT-2026-012"]);
+  assert.match(d.motivo, /no se puede sobrescribir/);
 });
 
 test("HU-6: fecha, moneda, país o id inválidos en lo corregido devuelven { ok: false } legible", async () => {
@@ -135,14 +135,13 @@ test("similitud de Jaccard: ignora tildes, mayúsculas y palabras vacías", () =
   assert.equal(similitudObjeto("", ""), 0);
 });
 
-test("RN2 por NIT y objeto similar: sin el mismo id, actualiza la fila y marca el choque de id", () => {
+test("S2: mismo NIT y objeto similar con otro número explícito es nuevo con aviso de posible renovación", () => {
   const ctx = proyectoTemporal();
   const ext = extraccionDeMensaje(ctx, "msg-001");
   const existente = fila({ id_contrato: "OTRO-1", nit_cliente: "890900111", objeto: ext.contrato.objeto.valor! });
   const r = clasificar({ extraccion: ext, corregido: {}, comercial: "", fecha_registro: "2026-08-04", maestro: [existente] });
-  assert.equal(r.clasificacion, "actualizacion");
-  assert.equal(r.id_contrato_existente, "OTRO-1");
-  assert.ok(r.requiere_revision.includes("conflicto: id_contrato"));
+  assert.deepEqual([r.clasificacion, r.propuesta?.id_contrato], ["nuevo", "CT-2026-015"]);
+  assert.ok(r.advertencias.some((a) => a.includes("Posible renovación de OTRO-1")));
 });
 
 test("un otrosí de un contrato que no está en el maestro se rechaza con motivo", () => {

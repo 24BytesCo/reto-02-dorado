@@ -32,8 +32,11 @@ const recortar = (s: string, max: number): string => {
 
 // ── Tipo de documento ──
 
-/** Clase de documento contractual que reconoce el extractor (HU-1). */
-export type TipoDocumento = "contrato" | "otrosi";
+/** Clase de documento contractual que reconoce el extractor (HU-1). Un acta de terminación modifica un contrato existente. */
+export type TipoDocumento = "contrato" | "otrosi" | "acta";
+
+/** Otrosí y acta modifican un contrato que ya existe: solo cuentan los campos que traen y nunca crean una fila (RN2). */
+export const esModificacion = (tipo: TipoDocumento): boolean => tipo !== "contrato";
 
 /** Cuántas líneas no vacías se revisan buscando el título: un membrete puede ir antes. */
 const LINEAS_ENCABEZADO = 5;
@@ -44,24 +47,54 @@ interface Encabezado {
   desdeTitulo: string;
 }
 
-/** Título CONTRATO u OTROSÍ dentro de las primeras líneas no vacías del texto. */
+/** Tipo según la línea del título. `\b` de JavaScript solo conoce letras ASCII: tras la «Í» de «OTROSÍ» nunca hay límite, por eso \p{L} con la bandera u. */
+function tipoDeTitulo(linea: string): TipoDocumento | null {
+  if (/^\s*OTROS[IÍ](?!\p{L})/iu.test(linea)) return "otrosi";
+  if (/^\s*ACTA\s+DE\s+TERMINACI[OÓ]N(?!\p{L})/iu.test(linea)) return "acta";
+  return /^\s*CONTRATO(?!\p{L})/iu.test(linea) ? "contrato" : null;
+}
+
+/** Título CONTRATO, OTROSÍ o ACTA DE TERMINACIÓN dentro de las primeras líneas no vacías del texto. */
 function encabezado(texto: string): Encabezado | null {
   const lineas = texto.split("\n");
   let revisadas = 0;
   for (let i = 0; i < lineas.length && revisadas < LINEAS_ENCABEZADO; i++) {
     if (!lineas[i].trim()) continue;
     revisadas++;
-    // `\b` de JavaScript solo conoce letras ASCII: tras la «Í» de «OTROSÍ» nunca hay límite. Se usa \p{L} con la bandera u.
-    const tipo = /^\s*OTROS[IÍ](?!\p{L})/iu.test(lineas[i]) ? "otrosi" : /^\s*CONTRATO(?!\p{L})/iu.test(lineas[i]) ? "contrato" : null;
+    const tipo = tipoDeTitulo(lineas[i]);
     if (tipo) return { tipo, desdeTitulo: lineas.slice(i).join("\n") };
   }
   return null;
 }
 
-/** Un adjunto es contractual si en sus primeras líneas se titula CONTRATO u OTROSÍ y nombra a las partes («Entre…»). */
+/**
+ * Un adjunto es contractual si en sus primeras líneas se titula CONTRATO, OTROSÍ o ACTA DE TERMINACIÓN y nombra
+ * a las partes: «Entre…», «entre las partes» o «Los suscritos…» (HU-1).
+ */
 export function tipoDocumento(texto: string): TipoDocumento | null {
-  if (!/(?<!\p{L})Entre(?!\p{L})/iu.test(texto)) return null;
+  if (!/(?<!\p{L})(?:Entre|Los\s+suscritos)(?!\p{L})/iu.test(texto)) return null;
   return encabezado(texto)?.tipo ?? null;
+}
+
+// ── Firma ──
+
+/** Marcas de un documento sin firmar en el membrete o el título: «BORRADOR», «PROPUESTA», «SIN FIRMA», «NO FIRMADA». */
+const MARCA_ENCABEZADO = /(?<!\p{L})(?:borrador|propuesta|sin\s+firmas?|no\s+firmad[oa]|pendiente\s+de\s+firma)(?!\p{L})/iu;
+/** Las mismas marcas en el cuerpo: solo en mayúsculas o inequívocas, porque «según la propuesta» es redacción normal. */
+const MARCA_CUERPO = /(?<!\p{L})(?:BORRADOR|NO\s+FIRMAD[OA]|SIN\s+FIRMAS?|[Pp]endiente\s+de\s+firma|PENDIENTE\s+DE\s+FIRMA|[Ss]in\s+firmas)(?!\p{L})/u;
+/** Cláusula de firma con espacios en blanco por llenar: «a los ____ días del mes de ______». */
+const FIRMA_EN_BLANCO = /se\s+firma.{0,160}?_{3,}/i;
+
+/**
+ * Señal de que el documento no está firmado (regla de gobierno: solo se registra lo firmado), o `null`.
+ * Un documento no firmado no se rechaza, porque es el contrato que viene; pero no se registra sin que la analista lo confirme.
+ */
+function senalSinFirma(texto: string): string | null {
+  const desdeTitulo = encabezado(texto)?.desdeTitulo ?? texto;
+  const membrete = texto.slice(0, texto.length - desdeTitulo.length) + (desdeTitulo.split("\n")[0] ?? "");
+  const marca = membrete.match(MARCA_ENCABEZADO) ?? desdeTitulo.match(MARCA_CUERPO);
+  if (marca) return `marca «${marca[0]}»`;
+  return FIRMA_EN_BLANCO.test(texto.replace(/\s+/g, " ")) ? "la cláusula de firma tiene espacios en blanco (____)" : null;
 }
 
 /** Describe un adjunto que no es contrato, para el motivo del rechazo (RN4). */
@@ -162,11 +195,27 @@ interface Plazo {
 }
 
 /**
+ * Acta de terminación: la fecha desde la que termina el contrato es su nueva fecha de fin. Una terminación
+ * anticipada cambia las alertas (HU-5), así que se propone con 0,7 y siempre pasa por la analista (RN5).
+ */
+function plazoDeActa(texto: string): Plazo {
+  const parrafo = parrafos(texto).find((p) => /terminad|terminaci/i.test(p) && !/se firma/i.test(p) && fechasEn(p).length > 0);
+  if (!parrafo) return { fecha_inicio: ausente(), fecha_fin: ausente(), advertencias: ["Acta de terminación sin fecha de terminación legible: la analista debe indicar la nueva fecha de fin."] };
+  const fin = fechasEn(parrafo)[0].iso;
+  return {
+    fecha_inicio: ausente(),
+    fecha_fin: campo(fin, 0.7, parrafo),
+    advertencias: [`Acta de terminación: propone adelantar fecha_fin a ${fin}; se confirma con la analista antes de escribir.`],
+  };
+}
+
+/**
  * Fechas del contrato a partir de la cláusula de PLAZO.
  * Explícitas («desde … hasta …») → confianza alta. Con plazo en meses y sin fecha de fin, la fecha de
  * fin se deriva (aniversario del inicio) y queda en revisión: se propone, no se afirma.
  */
 function extraerPlazo(texto: string, tipo: TipoDocumento): Plazo {
+  if (tipo === "acta") return plazoDeActa(texto);
   const parrafo = clausula(texto, "plazo") ?? "";
   const fechas = fechasEn(parrafo);
   // «a partir del 1 de septiembre» es un inicio explícito; «a partir de la fecha de su firma» se resuelve abajo.
@@ -182,7 +231,8 @@ function extraerPlazo(texto: string, tipo: TipoDocumento): Plazo {
   if (!inicio && /a partir de la fecha de (su )?firma/i.test(parrafo)) {
     const firma = fechaFirma(texto);
     if (firma) {
-      fecha_inicio = campo(firma.iso, firma.soloMes ? REGLAS.umbralConfianza : 0.9, firma.evidencia);
+      // 0,8 fijo y no el umbral: el día se deduce (fin de mes), pero el mes y el año están escritos. Si el umbral sube, este campo pasa a revisión.
+      fecha_inicio = campo(firma.iso, firma.soloMes ? 0.8 : 0.9, firma.evidencia);
       if (firma.soloMes) advertencias.push(`La firma no indica el día («${recortar(firma.evidencia, 60)}»): se toma el último día del mes como inicio.`);
     }
   }
@@ -197,9 +247,20 @@ function extraerPlazo(texto: string, tipo: TipoDocumento): Plazo {
 
 // ── Valor y moneda ──
 
-/** Convierte un monto con separadores colombianos («265.000.000») o estadounidenses («120,000.00»). */
+/**
+ * El apóstrofo de millones («265'000.000», «1'200,000.00») equivale al separador de miles que le sigue;
+ * sin otro separador después, es un punto.
+ */
+function sinApostrofo(s: string): string {
+  const i = s.indexOf("'");
+  if (i < 0) return s;
+  const siguiente = s.slice(i + 1).match(/[.,]/)?.[0] ?? ".";
+  return s.replace(/'/g, siguiente);
+}
+
+/** Convierte un monto con separadores colombianos («265.000.000», «265'000.000») o estadounidenses («120,000.00»). */
 export function parsearMonto(crudo: string): number {
-  const s = crudo.replace(/\s/g, "");
+  const s = sinApostrofo(crudo.replace(/\s/g, ""));
   const ultimoPunto = s.lastIndexOf(".");
   const ultimaComa = s.lastIndexOf(",");
   let normal: string;
@@ -228,6 +289,7 @@ interface ValorExtraido {
   valor: Campo<number>;
   moneda: Campo<Moneda>;
   indeterminado: boolean;
+  advertencias: string[];
 }
 
 /**
@@ -237,32 +299,82 @@ interface ValorExtraido {
 const CODIGOS_ISO = [...MONEDAS, "EUR", "GBP", "BRL", "MXN", "CLP", "ARS", "CAD", "CHF", "JPY", "CNY", "UYU", "BOB", "PYG", "CRC", "GTQ", "NIO", "DOP"];
 const ISO = CODIGOS_ISO.join("|");
 
+/** Monto con código ISO («COP $1.200», «USD 1,5») o con signo («$265'000.000»), seguido o no de un multiplicador en palabras. */
+const PATRON_MONTO = new RegExp(`(?:\\b(${ISO})\\s*\\$?|\\$)\\s*(\\d[\\d.,']*\\d|\\d)(?:\\s+(mil\\s+millones|millones|mill[oó]n|mil)(?!\\p{L}))?`, "giu");
+
+/** «COP 1.200 millones» = 1.200 × 10⁶; el orden importa: «mil millones» antes que «mil». */
+const MULTIPLICADORES: Array<[RegExp, number]> = [[/^mil\s+millones$/i, 1e9], [/^mill(?:ones|[oó]n)$/i, 1e6], [/^mil$/i, 1e3]];
+
 /** Monedas fuera del PRD escritas en palabras o con símbolo. */
 const MONEDA_NO_SOPORTADA = /(?<!\p{L})(euros?|libras(?:\s+esterlinas)?|reales)(?!\p{L})|€|£/iu;
 
+/** Un pago periódico en la cláusula de valor: el monto puede ser la cuota y no el total. */
+const PERIODICO = /mensual|por\s+mes|anual|por\s+a[nñ]o/i;
+
+interface Monto {
+  valor: number;
+  codigo: string | null;
+  indice: number;
+}
+
 const errorMoneda = (moneda: string) => new Error(`moneda desconocida: ${moneda} (se aceptan ${MONEDAS.join(", ")})`);
 
+/** Todos los montos de la cláusula, con su código ISO si lo trae y el multiplicador ya aplicado. */
+function montosEn(parrafo: string): Monto[] {
+  return [...parrafo.matchAll(PATRON_MONTO)].map((m) => {
+    const factor = m[3] ? MULTIPLICADORES.find(([p]) => p.test(m[3].replace(/\s+/g, " ")))?.[1] ?? 1 : 1;
+    // Redondeo a centavos: 1,5 × 10⁶ en coma flotante puede dar 1499999,9999.
+    return { valor: Math.round(parsearMonto(m[2]) * factor * 100) / 100, codigo: m[1] ?? null, indice: m.index ?? 0 };
+  });
+}
+
+/** El monto precedido de «total» sin otro monto en medio, a menos de 120 caracteres: «valor total de COP 120.000.000». */
+function montoTotal(parrafo: string, montos: Monto[]): Monto | null {
+  return montos.find((m, i) => {
+    const desde = i > 0 ? montos[i - 1].indice : 0;
+    const tramo = parrafo.slice(Math.max(desde, m.indice - 120), m.indice);
+    return /(?<!\p{L})total(?!\p{L})/iu.test(tramo);
+  }) ?? null;
+}
+
 const indeterminado = (parrafo: string, texto: string, pais: Pais | null): ValorExtraido =>
-  ({ valor: campo(0, 0.5, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: true });
+  ({ valor: campo(0, 0.5, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: true, advertencias: [] });
+
+/** Valor y moneda de un monto elegido: con código, la moneda es la del código (0,95); sin código, la implícita. */
+function desdeMonto(m: Monto, confianza: number, parrafo: string, texto: string, pais: Pais | null, advertencias: string[] = []): ValorExtraido {
+  const moneda = m.codigo && esMoneda(m.codigo) ? campo(m.codigo, 0.95, parrafo) : monedaImplicita(texto, pais);
+  return { valor: campo(m.valor, confianza, parrafo), moneda, indeterminado: false, advertencias };
+}
 
 /**
- * Valor y moneda desde la cláusula VALOR, en este orden: contrato por demanda, monto con código ISO,
- * moneda no soportada, monto con «$» (moneda implícita), «según las tarifas» sin monto. Moneda fuera del PRD → error (HU-6).
+ * Con varios montos distintos o un pago periódico, el valor del contrato es el que la cláusula llama «total» (0,85).
+ * Sin «total» no hay cómo saber cuál es: se propone el primero con 0,5 y va a revisión (O3).
+ */
+function elegirMonto(montos: Monto[], parrafo: string, texto: string, pais: Pais | null): ValorExtraido {
+  const distintos = new Set(montos.map((m) => m.valor)).size;
+  if (distintos === 1 && !PERIODICO.test(parrafo)) return desdeMonto(montos[0], montos[0].codigo ? 0.95 : 0.85, parrafo, texto, pais);
+  const total = montoTotal(parrafo, montos);
+  if (total) return desdeMonto(total, 0.85, parrafo, texto, pais);
+  const lista = montos.map((m) => m.valor).join(", ");
+  const aviso = `La cláusula de valor trae ${montos.length > 1 ? `varios montos (${lista})` : "un pago periódico"} y no dice cuál es el total: se propone ${montos[0].valor} y se pide revisión.`;
+  return desdeMonto(montos[0], 0.5, parrafo, texto, pais, [aviso]);
+}
+
+/**
+ * Valor y moneda desde la cláusula VALOR, en este orden: contrato por demanda, montos con código ISO o «$»
+ * (con multiplicador en palabras), moneda no soportada, «según las tarifas» sin monto. Moneda fuera del PRD → error (HU-6).
  */
 function extraerValor(texto: string, pais: Pais | null): ValorExtraido {
   const parrafo = clausula(texto, "valor") ?? "";
   if (/no tiene (un )?valor determinado|valor indeterminado|por demanda/i.test(parrafo)) return indeterminado(parrafo, texto, pais);
-  const conCodigo = parrafo.match(new RegExp(`\\b(${ISO})\\s*\\$?\\s*(\\d[\\d.,]*\\d|\\d)`));
-  if (conCodigo) {
-    if (!esMoneda(conCodigo[1])) throw errorMoneda(conCodigo[1]);
-    return { valor: campo(parsearMonto(conCodigo[2]), 0.95, parrafo), moneda: campo(conCodigo[1], 0.95, parrafo), indeterminado: false };
-  }
-  const noSoportada = parrafo.match(MONEDA_NO_SOPORTADA);
+  const montos = montosEn(parrafo);
+  const ajeno = montos.find((m) => m.codigo && !esMoneda(m.codigo));
+  if (ajeno?.codigo) throw errorMoneda(ajeno.codigo);
+  const noSoportada = montos.some((m) => m.codigo) ? null : parrafo.match(MONEDA_NO_SOPORTADA);
   if (noSoportada) throw errorMoneda(noSoportada[0]);
-  const conSigno = parrafo.match(/\$\s*(\d[\d.,]*\d)/);
-  if (conSigno) return { valor: campo(parsearMonto(conSigno[1]), 0.85, parrafo), moneda: monedaImplicita(texto, pais), indeterminado: false };
+  if (montos.length > 0) return elegirMonto(montos, parrafo, texto, pais);
   if (/seg[uú]n las tarifas/i.test(parrafo)) return indeterminado(parrafo, texto, pais);
-  return { valor: ausente(), moneda: monedaImplicita(texto, pais), indeterminado: false };
+  return { valor: ausente(), moneda: monedaImplicita(texto, pais), indeterminado: false, advertencias: [] };
 }
 
 /**
@@ -304,16 +416,20 @@ function canonizarRuc(parte: Parte, nombrePorId: (id: string) => string | null):
   return nombrePorId(primero) ? { ...parte, id: primero } : parte;
 }
 
-/** La contraparte es la primera parte nombrada cuyo identificador no es el de Periferia. */
-function contraparte(texto: string): Parte | null {
+/**
+ * Partes nombradas distintas de Periferia, en orden y sin repetir identificador. Arrancan con «Entre…»,
+ * «Los suscritos…», «entre las partes…» o «, y …»: la contraparte puede ir después de Periferia.
+ */
+function contrapartes(texto: string): Parte[] {
   const plano = texto.replace(/\s+/g, " ");
-  // La contraparte puede ir después de Periferia («… (EL CONTRATISTA) y ACME S.A.S., NIT …»), con o sin coma antes de la «y».
-  const patron = /(?:Entre|,?\s+y)\s+(?:los\s+suscritos,\s*)?([A-ZÁÉÍÓÚÑ][^,]{2,120}?),\s*(?:identificad[ao]\s+con\s+(?:el\s+)?|con\s+(?:el\s+)?)?(NIT|RUC|RTN)\s*(?:No\.?\s*)?(\d[\d.\-]*\d)/g;
+  const patron = /(?:(?:[Ee]ntre\s+)?(?:[Ll]os\s+suscritos|[Ll]as\s+partes)\s*[,:]?\s*|[Ee]ntre\s+|,?\s+y\s+)([A-ZÁÉÍÓÚÑ][^,]{2,120}?),\s*(?:identificad[ao]\s+con\s+(?:el\s+)?|con\s+(?:el\s+)?)?(NIT|RUC|RTN)\s*(?:No\.?\s*)?(\d[\d.\-]*\d)/g;
+  const partes: Parte[] = [];
   for (const m of plano.matchAll(patron)) {
     const id = normalizarIdentificador(m[2], m[3]);
-    if (id !== REGLAS.nitPropio) return { nombre: m[1].trim(), tipoId: m[2].toUpperCase(), id, evidencia: m[0] };
+    if (id === REGLAS.nitPropio || partes.some((p) => p.id === id)) continue;
+    partes.push({ nombre: m[1].trim(), tipoId: m[2].toUpperCase(), id, evidencia: m[0] });
   }
-  return null;
+  return partes;
 }
 
 /** País por formato del identificador. */
@@ -351,7 +467,8 @@ function extraerPais(texto: string, parte: Parte): Campo<Pais> {
   const porDomicilio = paisPorDomicilio(texto, parte.nombre);
   if (porId && porDomicilio) return porId === porDomicilio ? campo(porId, 0.95, parte.evidencia) : campo(porId, 0.5, parte.evidencia);
   if (porId) return campo(porId, 0.9, parte.evidencia);
-  if (porDomicilio) return campo(porDomicilio, REGLAS.umbralConfianza, parte.evidencia);
+  // 0,8 fijo y no el umbral: una sola señal (el domicilio) es una deducción razonable, no una afirmación del texto.
+  if (porDomicilio) return campo(porDomicilio, 0.8, parte.evidencia);
   return ausente();
 }
 
@@ -397,19 +514,37 @@ interface Poliza {
   advertencias: string[];
 }
 
-const slugPoliza = (s: string): string =>
-  normalizar(s).replace(/\s+y\s+/g, "_").replace(/\s+sociales$/, "").replace(/\s+/g, "_");
+/** Tipos de póliza del maestro (§7.2) y cómo se reconocen al inicio de un amparo nombrado. */
+const TIPOS_POLIZA: Array<[RegExp, string]> = [
+  [/^cumplimiento/, "cumplimiento"], [/^calidad/, "calidad"], [/^responsabilidad civil/, "responsabilidad_civil"],
+  [/^salarios y prestaciones/, "salarios_prestaciones"], [/^estabilidad/, "estabilidad"],
+];
+
+/** Un amparo: «cumplimiento», «calidad del servicio», «salarios y prestaciones sociales»… */
+const AMPARO = "(?:cumplimiento|calidad(?:\\s+del\\s+servicio)?|responsabilidad\\s+civil(?:\\s+extracontractual)?|salarios\\s+y\\s+prestaciones(?:\\s+sociales)?|estabilidad(?:\\s+de\\s+la\\s+obra)?)";
+/** Póliza seguida de uno o varios amparos: «pólizas de estabilidad y de calidad», «póliza de cumplimiento, de calidad y de salarios…». */
+const LISTA_POLIZAS = new RegExp(
+  `(?:p[oó]lizas?|garant[ií]as?(?:\\s+[uú]nicas?)?)\\s+de\\s+${AMPARO}(?:\\s*(?:,|\\s+y|\\s+e)\\s+(?:de\\s+(?:la\\s+)?)?${AMPARO})*`,
+  "gi",
+);
 
 /** Nombres de la cláusula de garantías: GARANTÍA(S), PÓLIZA(S), SEGUROS, «GARANTÍAS Y SEGUROS». */
 const CLAUSULA_POLIZA = "garantia\\w*(?:\\s+y\\s+seguros)?|poliza\\w*|seguros";
 /** Palabras que indican una póliza exigida en cualquier parte del texto. */
 const MENCION_POLIZA = /p[oó]liza|garant[ií]a\s+(?:[uú]nica|de\s+cumplimiento)/i;
+/** Póliza exigida solo a algunas órdenes de un contrato marco. «En caso de que se prorrogue…» no la vuelve condicional. */
+const POLIZA_CONDICIONAL = /para cada orden|cuyo valor (?:supere|exceda)/i;
 
-/** Tipos de póliza nombrados en un texto, como lista separada por «;» (§7.2). */
+/** Tipos de póliza nombrados en un texto, como lista separada por «;» en el orden en que aparecen (§7.2). */
 function tiposPoliza(texto: string): string {
-  const tipos = [...texto.matchAll(/(?:p[oó]lizas?|garant[ií]a\s+[uú]nica)\s+de\s+(cumplimiento|calidad|responsabilidad\s+civil|salarios\s+y\s+prestaciones(?:\s+sociales)?|estabilidad)/gi)]
-    .map((m) => slugPoliza(m[1]));
-  return [...new Set(tipos)].join(";");
+  const tipos: string[] = [];
+  for (const lista of normalizar(texto).matchAll(LISTA_POLIZAS)) {
+    for (const amparo of lista[0].matchAll(new RegExp(AMPARO, "gi"))) {
+      const tipo = TIPOS_POLIZA.find(([p]) => p.test(amparo[0].replace(/\s+/g, " ")))?.[1];
+      if (tipo && !tipos.includes(tipo)) tipos.push(tipo);
+    }
+  }
+  return tipos.join(";");
 }
 
 /** Sin cláusula de garantías: si el texto nombra una póliza va a revisión (0,6); si no la nombra en ningún lugar, no aplica (0,9). */
@@ -425,14 +560,15 @@ function polizaSinClausula(texto: string): Poliza {
 
 /** Póliza desde la cláusula de garantías (O4, HU-5). Una póliza exigida solo para algunas órdenes no aplica al contrato marco. */
 function extraerPoliza(texto: string, tipo: TipoDocumento): Poliza {
-  if (tipo === "otrosi") return { requiere_poliza: ausente(), tipo_poliza: ausente(), advertencias: [] };
+  if (esModificacion(tipo)) return { requiere_poliza: ausente(), tipo_poliza: ausente(), advertencias: [] };
   const parrafo = clausula(texto, CLAUSULA_POLIZA);
   if (!parrafo || !MENCION_POLIZA.test(parrafo)) return polizaSinClausula(texto);
   const lista = tiposPoliza(parrafo);
-  if (/para cada orden|cuyo valor supere|en caso de que|cuando el valor/i.test(parrafo)) {
+  if (POLIZA_CONDICIONAL.test(parrafo)) {
+    // 0,8 fijo y no el umbral: la cláusula sí está escrita; solo se interpreta que no aplica al contrato marco.
     return {
-      requiere_poliza: campo(false, REGLAS.umbralConfianza, parrafo),
-      tipo_poliza: campo("", REGLAS.umbralConfianza),
+      requiere_poliza: campo(false, 0.8, parrafo),
+      tipo_poliza: campo("", 0.8),
       advertencias: [`Póliza condicional: se exige ${lista || "póliza"} solo en ciertas órdenes de servicio («${recortar(parrafo, 120)}»).`],
     };
   }
@@ -448,8 +584,9 @@ const NUMERO = "N(?:o|°|º)\\.?";
 /** Número del contrato desde su título (después de un posible membrete); en un otrosí, el del contrato que modifica. */
 function extraerId(texto: string, tipo: TipoDocumento): Campo<string> {
   const plano = (encabezado(texto)?.desdeTitulo ?? texto).replace(/\s+/g, " ");
-  const patron = tipo === "otrosi"
-    ? new RegExp(`AL\\s+CONTRATO[^.]*?${NUMERO}\\s*${PATRON_ID.source}`, "i")
+  // Otrosí y acta citan el contrato que modifican: «OTROSÍ No. 1 AL CONTRATO No. …», «ACTA DE TERMINACIÓN DEL CONTRATO No. …».
+  const patron = esModificacion(tipo)
+    ? new RegExp(`(?:AL|DEL)\\s+CONTRATO[^.]*?${NUMERO}\\s*${PATRON_ID.source}`, "i")
     : new RegExp(`^\\s*CONTRATO[^.]*?${NUMERO}\\s*${PATRON_ID.source}`, "i");
   const m = plano.match(patron);
   return m ? campo(m[1], 0.95, m[0]) : ausente();
@@ -478,11 +615,41 @@ export interface Extraccion {
   numero_otrosi: number | null;
   contrato: ContratoExtraido;
   valor_indeterminado: boolean;
+  /** Por qué el documento parece no firmado (borrador, propuesta, firma en blanco), o `null`: no se registra sin confirmación. */
+  sin_firma: string | null;
   advertencias: string[];
 }
 
+interface PartesExtraidas {
+  parte: Parte | null;
+  cliente: Campo<string>;
+  advertencias: string[];
+}
+
+/** Contraparte y nombre del cliente. Con más de una contraparte (consorcio) no se elige: el cliente va a revisión (0,5). */
+function extraerPartes(texto: string, nombrePorId: (id: string) => string | null): PartesExtraidas {
+  const todas = contrapartes(texto);
+  const parte = todas[0] ? canonizarRuc(todas[0], nombrePorId) : null;
+  if (!parte) return { parte, cliente: ausente(), advertencias: [] };
+  const cliente = nombreCliente(texto, parte, nombrePorId);
+  if (todas.length === 1) return { parte, cliente, advertencias: [] };
+  const nombres = todas.map((p) => `${p.nombre} (${p.tipoId} ${p.id})`).join(", ");
+  return {
+    parte,
+    cliente: { ...cliente, confianza: 0.5 },
+    advertencias: [`El documento nombra más de una contraparte (${nombres}): se propone la primera y la analista decide cuál es el cliente.`],
+  };
+}
+
+/** Un acta de terminación no trae valor ni moneda: solo cambia la fecha de fin. */
+const sinValor = (): ValorExtraido => ({ valor: ausente(), moneda: ausente(), indeterminado: false, advertencias: [] });
+
+/** Advertencia de documento sin firmar (regla de gobierno): se registra solo si la analista lo confirma. */
+const avisoSinFirma = (senal: string): string =>
+  `El documento parece no firmado (${senal}): no se registra sin que la analista confirme que es la versión firmada.`;
+
 /**
- * Extrae los datos de un contrato u otrosí (HU-2).
+ * Extrae los datos de un contrato, otrosí o acta de terminación (HU-2).
  * @param texto texto del adjunto.
  * @param nombrePorId busca en el maestro el nombre de un cliente por su identificador.
  * @throws Error legible si el texto está vacío, no es contractual o trae una fecha o moneda inválida (HU-6).
@@ -491,22 +658,23 @@ export function extraerContrato(texto: string, nombrePorId: (id: string) => stri
   if (!texto.trim()) throw new Error("el adjunto está vacío");
   const tipo = tipoDocumento(texto);
   if (!tipo) throw new Error(describirNoContractual(texto));
-  const encontrada = contraparte(texto);
-  const parte = encontrada ? canonizarRuc(encontrada, nombrePorId) : null;
+  const partes = extraerPartes(texto, nombrePorId);
+  const parte = partes.parte;
   const pais = parte ? extraerPais(texto, parte) : ausente<Pais>();
   const plazo = extraerPlazo(texto, tipo);
-  const valor = extraerValor(texto, pais.valor);
+  const valor = tipo === "acta" ? sinValor() : extraerValor(texto, pais.valor);
   const poliza = extraerPoliza(texto, tipo);
+  const sin_firma = senalSinFirma(texto);
   const numero = texto.match(new RegExp(`OTROS[IÍ]\\s+${NUMERO}\\s*(\\d+)`, "i"));
   return {
     tipo_documento: tipo,
     numero_otrosi: tipo === "otrosi" && numero ? Number(numero[1]) : null,
     contrato: {
       id_contrato: extraerId(texto, tipo),
-      cliente: parte ? nombreCliente(texto, parte, nombrePorId) : ausente(),
+      cliente: partes.cliente,
       nit_cliente: parte ? campo(parte.id, 0.95, parte.evidencia) : ausente(),
       pais,
-      objeto: tipo === "otrosi" ? ausente() : extraerObjeto(texto),
+      objeto: esModificacion(tipo) ? ausente() : extraerObjeto(texto),
       valor: valor.valor,
       moneda: valor.moneda,
       fecha_inicio: plazo.fecha_inicio,
@@ -515,6 +683,7 @@ export function extraerContrato(texto: string, nombrePorId: (id: string) => stri
       tipo_poliza: poliza.tipo_poliza,
     },
     valor_indeterminado: valor.indeterminado,
-    advertencias: [...plazo.advertencias, ...poliza.advertencias],
+    sin_firma,
+    advertencias: [...partes.advertencias, ...plazo.advertencias, ...valor.advertencias, ...poliza.advertencias, ...(sin_firma ? [avisoSinFirma(sin_firma)] : [])],
   };
 }

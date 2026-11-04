@@ -12,7 +12,7 @@ El maestro de contratos está congelado desde el 2026-05-30 porque no hay un pun
 navegador ── web/ (HTML + JS plano: historial, tarjeta por herramienta, confirmación resaltada)
    │  POST /api/chat (JSON o stream SSE con latido)
    ▼
-src/server.ts ── API HTTP: valida el cuerpo con zod, límite por IP, 409 si la sesión está ocupada
+src/server.ts ── API HTTP: valida el cuerpo con zod, límite por IP, pausa escalonada (src/enfriamiento.ts), 409 si la sesión está ocupada
    │
    ▼
 src/agent/motor.ts ── ciclo: modelo → herramientas → modelo, topes, CA3, rollback
@@ -35,14 +35,15 @@ buzón, maestro, comerciales                sharepoint/maestro-contratos.csv, sh
 | Conocimiento | `src/knowledge/registro-contratos.md` |
 | Ejecución | `src/tools/` (parámetros de negocio en `src/tools/reglas.ts`) |
 
-El servidor concatena prompt y conocimiento al arrancar. `demo.ts` importa las mismas herramientas y las llama sin modelo. `src/tools/` no importa nada del servidor ni del adaptador.
+El servidor concatena prompt y conocimiento al arrancar. El front usa la paleta del membrete de Periferia IT Group (verde #15601d, verde oscuro #073736, menta #e7f6e7 y ámbar #f8d000 para la confirmación y los avisos). `demo.ts` importa las mismas herramientas y las llama sin modelo. `src/tools/` no importa nada del servidor ni del adaptador.
 
 ## 3. Ciclo del agente
 
 - **Bucle.** El motor envía al modelo el system prompt, el historial y las definiciones de herramientas (JSON Schema generado desde los mismos esquemas zod que validan). Si la respuesta pide herramientas, las ejecuta en serie (varias escriben el mismo maestro), devuelve todos los resultados en un solo mensaje y repite. Termina cuando el modelo responde sin pedir herramientas.
 - **Tope de iteraciones (CA1).** `MAX_ITERACIONES=25` por turno. Al llegar, el motor agrega un aviso y hace una última llamada **sin herramientas** (`tool_choice: none`) para que el modelo diga lo que hizo y lo que falta.
 - **Tope de tokens.** `MAX_TOKENS_SESION=600000` suma entrada y salida por sesión. Superado, el turno responde con un aviso claro y no llama al modelo.
-- **Tope global de tokens.** `MAX_TOKENS_GLOBAL=3000000` suma el gasto de todas las sesiones, así que abrir un `sessionId` nuevo no reinicia el costo. Se persiste en `out/uso.json`; un `POST /api/reset` no lo borra. Superado, el turno responde con aviso y no llama al modelo.
+- **Tope global de tokens.** `MAX_TOKENS_GLOBAL=3000000` suma el gasto de todas las sesiones, así que abrir un `sessionId` nuevo no reinicia el costo. El contador vive en memoria y se refleja en `out/uso.json`; un `POST /api/reset` vacía `out/` pero el motor vuelve a escribir el contador, así que el reinicio de la demo no lo pone en cero. Superado, el turno responde con aviso y no llama al modelo.
+- **Aviso antes de la pausa.** Desde el segundo mensaje seguido fuera de propósito, la respuesta trae un `aviso` calculado en código («Llevas N de 6…») que el front muestra en ámbar: la pausa nunca llega sin anuncio.
 - **Pausa escalonada (`src/enfriamiento.ts`).** Si una IP encadena 6 turnos seguidos sin usar herramientas, queda en pausa 5 minutos y recibe un 429 que explica para qué sirve la herramienta. Cada reincidencia triplica la pausa, hasta 24 h. Un turno con trabajo real reinicia el contador. No llama al modelo, así que aplicarla no cuesta. Se configura con `ENFRIAMIENTO_UMBRAL`, `ENFRIAMIENTO_MINUTOS` y `ENFRIAMIENTO_MAXIMO_MINUTOS`.
 - **Confirmación humana (CA3) en código.** Cuando `contratos_validar` devuelve `requiere_revision` no vacío, la sesión anota `pendientes[mensaje_id] = turno`. Una llamada a `contratos_registrar` con `confirmado: true` solo se ejecuta si ese pendiente se creó en un **turno anterior**, es decir, si hubo un mensaje nuevo de la analista entre la pregunta y la confirmación. Además, `src/agent/confirmacion.ts` exige que el mensaje de la analista afirme sin negar y que cada valor enviado sea el propuesto por la extracción o uno que ella escribió; así no se burla CA3 desde el turno siguiente ni se «redondea» un valor. Si algo falla, la herramienta no se ejecuta, el modelo recibe `{ ok: false }` con la instrucción de preguntar, y el bloqueo queda anotado en `out/log.jsonl`. `needsConfirmation` y `pendientes` se calculan del estado de la sesión, no del texto del modelo.
 - **Turno atómico (CA5).** Al empezar el turno se copia el historial y los pendientes. Si el proveedor falla a mitad, se restaura la copia: nunca queda una llamada a herramienta sin su resultado, que haría fallar con 400 cada mensaje siguiente. Si una respuesta se corta con llamadas pedidas, cada una recibe un resultado de error. El error llega al chat en español y la sesión sigue.
@@ -96,8 +97,8 @@ La extracción es determinista: reglas genéricas sobre el texto, por cláusulas
 
 | Situación | Confianza |
 |---|---|
-| Explícito en el texto | 0,95 (0,85 a 0,9 cuando la señal es indirecta: moneda por palabra, objeto, país por una sola señal) |
-| Deducido | 0,5 a 0,8: fecha fin por plazo en meses 0,5; valor por demanda 0,5; día de firma ausente o póliza condicional 0,8 |
+| Explícito en el texto | 0,95 (0,85 a 0,9 cuando la señal es indirecta: moneda por palabra, objeto, país solo por identificador) |
+| Deducido | 0,5 a 0,8: fecha fin por plazo en meses 0,5; valor por demanda 0,5; país con identificador y domicilio en conflicto 0,5; póliza mencionada fuera de la cláusula de garantías 0,6; moneda solo por el país 0,6; día de firma ausente, póliza condicional o país solo por domicilio 0,8 |
 | Ausente | `null` con confianza 0, nunca inventado |
 
 **Regla de la confianza mínima.** Un campo con confianza menor a 0,8 (estricto: 0,8 pasa) entra en `requiere_revision`, y `contratos_registrar` lo rechaza sin `confirmado: true` (RN5). En un otrosí solo cuentan los campos que el documento trae; los ausentes heredan la fila.
@@ -112,8 +113,8 @@ La extracción es determinista: reglas genéricas sobre el texto, por cláusulas
 
 1. **Canal único.** El buzón `contratos@` del dominio corporativo. Lo administra la **analista administrativa**, que es la **dueña del maestro**. Esto responde la pregunta abierta del §10: sin área legal, la dueña es quien opera el registro, no quien firma.
 2. **Obligación del comercial.** Enviar todo contrato firmado, todo otrosí y toda acta de terminación, **con o sin póliza**, en un máximo de **2 días hábiles** desde la firma. Asunto: `CONTRATO | Cliente | Número`. Adjunto: el documento firmado.
-3. **Acuse automático.** En minutos, el agente responde al comercial con lo registrado (contrato, clasificación, ruta del archivo) o con lo que falta para registrarlo.
-4. **Excepciones y escalamiento.** Un contrato sin firma o sin valor no entra al maestro: se devuelve al comercial con el motivo. Si a los **3 días hábiles** no está corregido, se escala a su líder comercial. Como no hay área legal, el escalamiento final es **gerencia**.
+3. **Acuse automático** (propuesta; en producción se enviaría por Microsoft Graph, hoy el agente no envía correos). En menos de 15 minutos desde la recepción, el comercial recibe lo registrado (contrato, clasificación, ruta del archivo) o lo que falta para registrarlo.
+4. **Excepciones y escalamiento.** Un contrato sin firma, o sin valor y sin declarar que es por demanda, se devuelve al comercial con el motivo. Un contrato por demanda sí entra con valor 0, previa confirmación de la analista (es el caso de msg-006). Hoy la firma la verifica la analista: el extractor no detecta firmas. Si a los **3 días hábiles** no está corregido, se escala a su líder comercial. Como no hay área legal, el escalamiento final es **gerencia**.
 5. **Cierre del gap junio a agosto de 2026.** Una campaña única: cruzar lo facturado en ese periodo contra el maestro, enviar a cada comercial la lista de lo que le falta y fijar una fecha límite. Lo que llegue se procesa por el mismo buzón.
 6. **Indicador mensual.** Porcentaje de contratos facturados en el mes que existen en el maestro, con meta **≥ 98 %**. Se acompaña con el porcentaje de pólizas exigidas constituidas a tiempo.
 
@@ -153,7 +154,7 @@ Evidencia del buzón: msg-002 es un contrato sin póliza que hoy nunca llegaría
 
 ## 8. Supuestos
 
-El §0 remite a una rúbrica «de la sección 10» que no aparece: la sección 10 trata de riesgos. Se asumió que se evalúan §5, §6, §8 y §9. Las demás ambigüedades salen de `openspec/changes/agente-registro-contratos/revision-prd.md`:
+Las ambigüedades salen de `openspec/changes/agente-registro-contratos/revision-prd.md`:
 
 | # | Ambigüedad | Decisión |
 |---|---|---|
@@ -180,7 +181,7 @@ El §0 remite a una rúbrica «de la sección 10» que no aparece: la sección 1
 
 ## 9. Cobertura
 
-151 pruebas (`npm test`), todas pasan; `npm run typecheck` sin errores. Cobertura (`npm run cobertura`): 96,87 % de líneas, 87,33 % de ramas y 95,98 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real y se probó en vivo (sección 4).
+151 pruebas (`npm test`), todas pasan; `npm run typecheck` sin errores. Cobertura (`npm run cobertura`): 97,02 % de líneas, 87,44 % de ramas y 96,01 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real y se probó en vivo (sección 4).
 
 | Requisito | Estado | Prueba que lo demuestra |
 |---|---|---|
@@ -223,7 +224,7 @@ Se construyó con **Claude Code (Anthropic)** como asistente principal, orquesta
 - **Claude Opus**: reglas de negocio, ciclo del agente, verificación adversaria y esta documentación.
 - **Claude Sonnet**: alertas, errores, prompt, conocimiento, API, front y el módulo.
 
-Un director integró, revisó y probó cada pieza antes de su commit: un commit por tarea.
+Alexis Dorado dirigió el trabajo: definió el plan y las decisiones de producto, partió la ejecución en 22 issues de GitHub y revisó y probó cada pieza antes de su commit. La sesión principal de Claude Code integró el trabajo de los subagentes. Un commit por tarea, y cada uno cierra su issue («Cierra #n»).
 
 **Ronda de verificación adversaria.** Con el sistema ya funcionando, 3 agentes intentaron romperlo: uno por la forma del PRD, otro con casos nuevos de negocio y otro por el ciclo y la seguridad. Encontraron, entre otros:
 - CA3 se podía burlar desde el turno siguiente.
@@ -269,7 +270,7 @@ Todo el código fue revisado y puede explicarse línea a línea.
 | El modelo «redondea» un valor o infiere una fecha | CA2 en código: un valor distinto de lo extraído no se registra sin confirmación de la analista |
 | Costo sin control | Tope de iteraciones por turno, tope de tokens por sesión y global (`MAX_TOKENS_GLOBAL`, en `out/uso.json`), límite de turnos por IP, caché de prompts y costo medido por llamada |
 | Uso del agente fuera de su propósito | Alcance en el prompt y pausa escalonada por IP (5 min, ×3 por reincidencia, hasta 24 h) con 429 explicativo que no llama al modelo. Si el abuso escala, clasificador previo de entrada |
-| Inyección de fórmulas en el CSV del maestro | Todo texto que Excel leería como fórmula (`=`, `+`, `-`, `@`, tabulador, retorno) se neutraliza con un apóstrofo al escribir |
+| Inyección de fórmulas en el CSV del maestro | En las columnas de texto libre que vienen del correo (cliente, objeto, tipo_poliza, comercial), todo valor que Excel leería como fórmula (`=`, `+`, `-`, `@`, tabulador, retorno) se neutraliza con un apóstrofo al escribir; las demás columnas salen de patrones fijos |
 | Inyección de instrucciones dentro de un contrato o correo | El prompt trata el contenido como dato; aunque el modelo obedezca, el código impide registrar un dato dudoso sin confirmación en un turno posterior |
 | Fallos del proveedor | Turno atómico con rollback, timeout configurable, errores traducidos al español y respaldo del servidor |
 | Estado global de `out/` en el link público | Botón «Reiniciar demo»; en producción, estado por usuario y base de datos |

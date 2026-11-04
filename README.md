@@ -25,7 +25,7 @@ Sin clave se puede levantar con `LLM_PROVEEDOR=simulado`: el chat responde, pero
 | `ANTHROPIC_API_KEY` | (vacía) | Clave del modelo. Solo en el backend; nunca llega al front, al repositorio ni a los logs |
 | `LLM_PROVEEDOR` | `anthropic` | `anthropic` o `simulado` (sin clave, para pruebas) |
 | `LLM_MODELO` | `claude-opus-5-5` | Modelo. Alternativa: `claude-sonnet-5-5` |
-| `LLM_ESFUERZO` | `low` | Esfuerzo de razonamiento: `low`, `medium` o `high` |
+| `LLM_ESFUERZO` | `low` | Esfuerzo de razonamiento: `low`, `medium`, `high`, `xhigh` o `max`; un valor desconocido usa `low` |
 | `LLM_TIMEOUT_MS` | `90000` | Tiempo máximo de espera al proveedor |
 | `MAX_ITERACIONES` | `25` | Tope de idas modelo → herramientas por turno (CA1) |
 | `MAX_TOKENS_SESION` | `600000` | Tope de tokens de entrada y salida por sesión (costo) |
@@ -67,19 +67,19 @@ npm run cobertura    # cobertura con la herramienta de Node
 npm run modulo       # regenera modulo/ (prompt, conocimiento y herramientas empaquetadas)
 ```
 
-Cobertura medida: 96,87 % de líneas, 87,33 % de ramas y 95,98 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
+Cobertura medida: 97,02 % de líneas, 87,44 % de ramas y 96,01 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
 
 ## API
 
 | Método | Ruta | Entrada → salida |
 |---|---|---|
-| `POST` | `/api/chat` | `{ sessionId, message }` → `{ reply, toolCalls[], needsConfirmation, pendientes }` |
+| `POST` | `/api/chat` | `{ sessionId, message }` → `{ reply, toolCalls[], needsConfirmation, pendientes, aviso? }` (`aviso` llega desde el segundo mensaje seguido fuera de propósito) |
 | `POST` | `/api/chat` con `Accept: text/event-stream` | Stream SSE: eventos `texto`, `herramienta`, `resultado`, `uso`, `error` y un `fin` con el mismo objeto de arriba. Latido (`: latido`) cada 15 s |
 | `GET` | `/api/sessions/:id` | `{ id, creada, turnos[], tokens }`, o 404 si no existe |
 | `GET` | `/api/health` | `{ ok, provider, model }`, sin claves |
 | `POST` | `/api/reset` | Borra `out/` y las sesiones; el buzón vuelve a tener los 6 mensajes. 409 si hay un turno en curso |
 
-`needsConfirmation` y `pendientes` los calcula el servidor, no el modelo. Otros códigos: 400 (cuerpo inválido), 409 (la sesión ya tiene un turno en curso), 413 (más de 32 kb), 429 (límite de turnos por hora).
+`needsConfirmation` y `pendientes` los calcula el servidor, no el modelo. Otros códigos: 400 (cuerpo inválido), 409 (la sesión ya tiene un turno en curso), 413 (más de 32 kb), 429 (límite de turnos por hora, o pausa por uso fuera de propósito; ambos con `Retry-After`).
 
 ## Estructura
 
@@ -90,6 +90,9 @@ src/tools/                           ejecución: herramientas contratos_* y regl
 src/agent/                           ciclo del agente, confirmación (CA3) y sesiones
 src/llm/                             adaptador propio: Anthropic y simulado
 src/server.ts                        API HTTP y front estático
+src/enfriamiento.ts                  pausa por uso fuera de propósito
+scripts/generar-modulo.ts            generador del módulo del bonus
+modulo/                              bonus §9.4, generado desde las mismas fuentes
 web/                                 chat en HTML y JavaScript plano
 demo.ts                              herramientas sin modelo
 tests/                               pruebas

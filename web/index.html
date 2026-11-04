@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Agente de registro de contratos</title>
+  <link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+  <header class="barra">
+    <div class="titulo">
+      <h1>Agente de registro de contratos</h1>
+      <p id="estado-modelo" class="sub">Conectando…</p>
+    </div>
+    <div class="acciones">
+      <button type="button" id="btn-ejemplo" class="boton secundario">Ejemplo del PRD §11</button>
+      <button type="button" id="btn-reiniciar" class="boton peligro">Reiniciar demo</button>
+    </div>
+  </header>
+
+  <main id="chat" class="chat" aria-live="polite" aria-label="Conversación con el agente"></main>
+
+  <section id="aviso-confirmacion" class="aviso-confirmacion" role="alert" hidden>
+    <div class="aviso-texto">
+      <strong>El agente espera tu confirmación</strong>
+      <span id="aviso-detalle"></span>
+    </div>
+    <button type="button" id="btn-confirmo" class="boton ambar">Prellenar «Confirmo »</button>
+  </section>
+
+  <form id="formulario" class="compositor" autocomplete="off">
+    <label for="entrada" class="solo-lectores">Mensaje para el agente</label>
+    <textarea id="entrada" rows="2" maxlength="4000" placeholder="Escribe un mensaje. Enter envía, Shift+Enter agrega una línea."></textarea>
+    <button type="submit" id="btn-enviar" class="boton primario">Enviar</button>
+  </form>
+
+  <script src="app.js"></script>
+</body>
+</html>

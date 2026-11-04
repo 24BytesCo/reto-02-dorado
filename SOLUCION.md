@@ -42,7 +42,9 @@ El servidor concatena prompt y conocimiento al arrancar. `demo.ts` importa las m
 - **Bucle.** El motor envía al modelo el system prompt, el historial y las definiciones de herramientas (JSON Schema generado desde los mismos esquemas zod que validan). Si la respuesta pide herramientas, las ejecuta en serie (varias escriben el mismo maestro), devuelve todos los resultados en un solo mensaje y repite. Termina cuando el modelo responde sin pedir herramientas.
 - **Tope de iteraciones (CA1).** `MAX_ITERACIONES=25` por turno. Al llegar, el motor agrega un aviso y hace una última llamada **sin herramientas** (`tool_choice: none`) para que el modelo diga lo que hizo y lo que falta.
 - **Tope de tokens.** `MAX_TOKENS_SESION=600000` suma entrada y salida por sesión. Superado, el turno responde con un aviso claro y no llama al modelo.
-- **Confirmación humana (CA3) en código.** Cuando `contratos_validar` devuelve `requiere_revision` no vacío, la sesión anota `pendientes[mensaje_id] = turno`. Una llamada a `contratos_registrar` con `confirmado: true` solo se ejecuta si ese pendiente se creó en un **turno anterior**, es decir, si hubo un mensaje nuevo de la analista entre la pregunta y la confirmación. Si no, la herramienta no se ejecuta, el modelo recibe `{ ok: false }` con la instrucción de preguntar, y el bloqueo queda anotado en `out/log.jsonl`. `needsConfirmation` y `pendientes` se calculan del estado de la sesión, no del texto del modelo.
+- **Tope global de tokens.** `MAX_TOKENS_GLOBAL=3000000` suma el gasto de todas las sesiones, así que abrir un `sessionId` nuevo no reinicia el costo. Se persiste en `out/uso.json`; un `POST /api/reset` no lo borra. Superado, el turno responde con aviso y no llama al modelo.
+- **Pausa escalonada (`src/enfriamiento.ts`).** Si una IP encadena 6 turnos seguidos sin usar herramientas, queda en pausa 5 minutos y recibe un 429 que explica para qué sirve la herramienta. Cada reincidencia triplica la pausa, hasta 24 h. Un turno con trabajo real reinicia el contador. No llama al modelo, así que aplicarla no cuesta. Se configura con `ENFRIAMIENTO_UMBRAL`, `ENFRIAMIENTO_MINUTOS` y `ENFRIAMIENTO_MAXIMO_MINUTOS`.
+- **Confirmación humana (CA3) en código.** Cuando `contratos_validar` devuelve `requiere_revision` no vacío, la sesión anota `pendientes[mensaje_id] = turno`. Una llamada a `contratos_registrar` con `confirmado: true` solo se ejecuta si ese pendiente se creó en un **turno anterior**, es decir, si hubo un mensaje nuevo de la analista entre la pregunta y la confirmación. Además, `src/agent/confirmacion.ts` exige que el mensaje de la analista afirme sin negar y que cada valor enviado sea el propuesto por la extracción o uno que ella escribió; así no se burla CA3 desde el turno siguiente ni se «redondea» un valor. Si algo falla, la herramienta no se ejecuta, el modelo recibe `{ ok: false }` con la instrucción de preguntar, y el bloqueo queda anotado en `out/log.jsonl`. `needsConfirmation` y `pendientes` se calculan del estado de la sesión, no del texto del modelo.
 - **Turno atómico (CA5).** Al empezar el turno se copia el historial y los pendientes. Si el proveedor falla a mitad, se restaura la copia: nunca queda una llamada a herramienta sin su resultado, que haría fallar con 400 cada mensaje siguiente. Si una respuesta se corta con llamadas pedidas, cada una recibe un resultado de error. El error llega al chat en español y la sesión sigue.
 - **Sesiones.** En memoria y persistidas en `out/sesiones/<id>.json` con escritura atómica. El historial vive en el backend: el navegador no puede inyectar resultados de herramientas ni una confirmación. Un motor nuevo recarga la sesión del disco.
 - **Stream con latido.** El prompt del §11 tarda más de lo que aguantan el proxy (Nginx Proxy Manager corta a los 60 s sin bytes) y Cloudflare (100 s). Con `Accept: text/event-stream` la API emite cada paso como evento SSE y un comentario `: latido` cada 15 s. Si el navegador se desconecta, el turno termina igual y queda en la sesión.
@@ -102,7 +104,7 @@ La extracción es determinista: reglas genéricas sobre el texto, por cláusulas
 
 **Dónde entra el modelo.** Orquesta las herramientas, conversa con la analista, presenta los campos dudosos con su evidencia y recibe sus correcciones, que vuelven a pasar por `contratos_validar`.
 
-**Dónde no.** Nunca extrae ni calcula valores. CA2 está en código: `contratos_validar` y `contratos_registrar` revalidan desde el buzón y no confían en lo que mande el modelo. Todo valor distinto de lo extraído entra en revisión aunque el campo no fuera dudoso, así que `registrar` lo rechaza si no fue confirmado por la analista en un turno anterior. Los días restantes y los conteos de las alertas también salen de la herramienta.
+**Dónde no.** Nunca extrae ni calcula valores. CA2 está en código: `contratos_validar` y `contratos_registrar` revalidan desde el buzón y no confían en lo que mande el modelo. Todo valor distinto de lo extraído entra en revisión aunque el campo no fuera dudoso, así que `registrar` lo rechaza si no fue confirmado por la analista en un turno anterior. Y al confirmar no se pueden cambiar campos que no estaban en revisión: `registrar` responde que no estaban en revisión y pide validar de nuevo. Los días restantes y los conteos de las alertas también salen de la herramienta.
 
 ## 6. Regla de gobierno
 
@@ -130,7 +132,13 @@ Evidencia del buzón: msg-002 es un contrato sin póliza que hoy nunca llegaría
 | Stream SSE con latido cada 15 s (JSON si no se pide stream) | Respuesta bloqueante | El §11 supera el timeout del proxy (60 s) y de Cloudflare (100 s); además muestra cada herramienta en vivo |
 | RN1 antes que RN2, comparando id, valor y fechas | RN2 literal («mismo id y algún campo distinto») | msg-004 reenvía el contrato con el objeto redactado distinto; con RN2 literal se reescribiría una fila buena |
 | Mismo NIT no basta: exige además objeto con similitud de Jaccard ≥ 0,9 | Deduplicar solo por NIT | Tres contratos nuevos (msg-001, 002 y 006) comparten NIT con contratos existentes |
+| Alcance en el prompt (`## Alcance`) + topes en código (pausa escalonada, tokens por sesión y globales, turnos por IP) | Clasificador previo de entrada (guardrails tipo Bedrock Guardrails o NeMo) | Suma costo y latencia a cada mensaje para un riesgo que los topes ya acotan. Queda como siguiente paso si el uso escala |
+| CSP estricta sin `'unsafe-inline'` y HTML con `Cache-Control: no-transform` | Abrir `'unsafe-inline'` en la CSP | Cloudflare inyecta un script en línea de detección de bots que la CSP bloqueaba. `no-transform` evita la inyección (documentado en JavaScript Detections de Cloudflare). Alternativa: un nonce por petición en la cabecera CSP, que Cloudflare reutiliza |
 | Node 22 + `tsx` | Bun como runtime principal | El PRD admite los dos; Node viene en la imagen oficial y `node:test` no agrega dependencias. La demo se probó también con Bun |
+
+**Alcance.** `agent/prompt.md`, sección «Alcance»: el agente solo atiende el registro de contratos (buzón, maestro, alertas). Cualquier otra cosa se responde en una frase, sin herramientas, que explica para qué sirve la herramienta. Única excepción: si alguien dice que piensa hacerse daño, responde una vez, en dos frases, con la Línea 106 o la 192 opción 4 en Colombia, y vuelve a su propósito.
+
+**Módulo del bonus autónomo.** `npm run modulo` empaqueta con esbuild las herramientas en `modulo/tools/contratos.js` (solo requiere `zod`, externa). Es el artefacto portable del §9.4; `tests/modulo.test.ts` regenera el paquete en memoria y lo compara con el del repositorio.
 
 **Dependencias, todas justificadas:**
 
@@ -141,6 +149,7 @@ Evidencia del buzón: msg-002 es un contrato sin póliza que hoy nunca llegaría
 | `@anthropic-ai/sdk` | Cliente oficial del proveedor; solo lo importa `src/llm/anthropic.ts` |
 | `tsx` | Ejecuta TypeScript sin paso de compilación |
 | `typescript` (+ `@types/*`) | Solo para `npm run typecheck`, en modo strict y sin `any` |
+| `esbuild` (desarrollo) | Solo para `npm run modulo`: empaqueta las herramientas en un archivo |
 
 ## 8. Supuestos
 
@@ -166,10 +175,12 @@ El §0 remite a una rúbrica «de la sección 10» que no aparece: la sección 1
 | S16 | `bun install && bun run demo.ts` frente a Node + tsx | Node 22 + tsx; la demo se probó también con Bun con la misma salida |
 | S17 | `out/` global en un link público | Estado global (el reto no pide multiusuario) y `POST /api/reset` con botón en el front |
 | S18 | Objeto de más de 200 caracteres (msg-006 mide 222) | Recorte sin partir palabras y sin bajar la confianza |
+| S19 | RUC de Panamá con guiones («155612345-2-2017») | Se compara con el maestro por su primer segmento, que es como el maestro lo guarda. Si ese segmento no está, se conserva el RUC completo para no fusionar contribuyentes distintos |
+| S20 | Moneda que la cláusula VALOR no dice ni el texto menciona | Se deduce solo por el país con confianza 0,6, bajo el umbral: va a revisión |
 
 ## 9. Cobertura
 
-97 pruebas (`npm test`), todas pasan; `npm run typecheck` sin errores.
+151 pruebas (`npm test`), todas pasan; `npm run typecheck` sin errores. Cobertura (`npm run cobertura`): 96,87 % de líneas, 87,33 % de ramas y 95,98 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real y se probó en vivo (sección 4).
 
 | Requisito | Estado | Prueba que lo demuestra |
 |---|---|---|
@@ -181,7 +192,7 @@ El §0 remite a una rúbrica «de la sección 10» que no aparece: la sección 1
 | HU-6 Manejo de errores | Hecho | `tests/errores.test.ts` |
 | CA1 Tope de iteraciones | Hecho | `tests/ciclo.test.ts` («CA1: al llegar al tope…») |
 | CA2 Ningún valor fuera de herramientas | Hecho, en código | `tests/validar.test.ts` y `tests/registrar.test.ts` («CA2: …») |
-| CA3 Confirmación humana | Hecho, en código | `tests/ciclo.test.ts` («CA3: confirmar en el mismo turno… se bloquea») |
+| CA3 Confirmación humana | Hecho, en código | `tests/ciclo.test.ts` («CA3: confirmar en el mismo turno… se bloquea») y `tests/ca3.test.ts` (afirmación sin negación, valores propuestos o escritos por la analista) |
 | CA4 Llamadas visibles y en el log | Hecho | `tests/ciclo.test.ts`, `tests/nucleo.test.ts` |
 | CA5 Errores claros, sesión viva | Hecho | `tests/ciclo.test.ts` («CA5: si el proveedor falla a mitad de turno…») |
 | RN1 Duplicado | Hecho | msg-004 en `tests/validar.test.ts` y `tests/registrar.test.ts` |
@@ -192,9 +203,11 @@ El §0 remite a una rúbrica «de la sección 10» que no aparece: la sección 1
 | RN6 Fixture de solo lectura | Hecho | `tests/almacen.test.ts`, estado final en `tests/registrar.test.ts` |
 | RN7 `out/log.jsonl` | Hecho | `tests/nucleo.test.ts` |
 | API y stream con latido | Hecho | `tests/api.test.ts` |
+| Pausa escalonada y tope global de tokens | Hecho | `tests/enfriamiento.test.ts`, `tests/ca3.test.ts` |
+| Casos nuevos de la verificación adversaria | Hecho | `tests/casos-nuevos.test.ts`, `tests/almacen-seguridad.test.ts` |
 | `demo.ts` sin modelo | Hecho | `npm run demo` y `bun run demo.ts` |
 | `contratos_leer_pdf` (P1) | No hecho | Los fixtures son `.txt` |
-| Bonus `modulo/` | Hecho | `tests/modulo.test.ts` (falla si las piezas se separan de su fuente) |
+| Bonus `modulo/` | Hecho | `tests/modulo.test.ts` (falla si las piezas, incluido el paquete de herramientas regenerado, se separan de su fuente) |
 
 **Qué falta para producción:**
 - Exchange y SharePoint reales vía Microsoft Graph, en lugar de carpetas locales.
@@ -212,6 +225,15 @@ Se construyó con **Claude Code (Anthropic)** como asistente principal, orquesta
 
 Un director integró, revisó y probó cada pieza antes de su commit: un commit por tarea.
 
+**Ronda de verificación adversaria.** Con el sistema ya funcionando, 3 agentes intentaron romperlo: uno por la forma del PRD, otro con casos nuevos de negocio y otro por el ciclo y la seguridad. Encontraron, entre otros:
+- CA3 se podía burlar desde el turno siguiente.
+- Un correo roto tumbaba `leer_buzon`.
+- Una respuesta vacía del modelo mataba la sesión.
+- Variantes de redacción hacían perder la póliza o rechazaban contratos válidos.
+- Inyección de fórmulas en el CSV.
+
+4 agentes los corrigieron, con una prueba por arreglo (`tests/ca3.test.ts`, `tests/casos-nuevos.test.ts`, `tests/almacen-seguridad.test.ts`).
+
 Antes de la sesión se preparó una base genérica de ciclo y chat a partir del instructivo. El repositorio de entrega se creó desde cero al iniciar. Antes de escribir código, cuatro agentes independientes revisaron el PRD (literal, valores esperados, adversaria y entrega); la síntesis está en `openspec/changes/agente-registro-contratos/revision-prd.md`.
 
 **Qué se descartó de lo que propuso la IA, y por qué:**
@@ -224,6 +246,8 @@ Antes de la sesión se preparó una base genérica de ciclo y chat a partir del 
 | El extractor genérico de la base previa, por sinónimos «etiqueta: valor» | No sirve para contratos en prosa; se reescribió por cláusulas |
 | Pausar el ciclo con botones de aprobar y rechazar | El PRD pide una pregunta y la confirmación en el siguiente mensaje |
 | Compactar el historial | Reescribe valores de herramientas y no hace falta |
+| Un clasificador previo de entrada (guardrails) para filtrar mensajes fuera de propósito | Costo y latencia en cada mensaje; el alcance en el prompt más los topes en código bastan por ahora |
+| Construir el front con una herramienta externa (Lovable) | Riesgo, y se quiere poder explicar cada línea; el front es HTML y JavaScript plano |
 | Reescribir la historia de git para cambiar el formato de los títulos de tareas | El historial de commits es parte de la entrega; no se reescribe |
 
 **Errores de la IA que detectaron las pruebas:**
@@ -243,7 +267,9 @@ Todo el código fue revisado y puede explicarse línea a línea.
 | Formatos de contrato que el extractor no conoce | Todo campo no reconocido queda ausente o con confianza baja y va a revisión humana. Las reglas se amplían con casos reales. El modelo puede proponer, pero la herramienta valida |
 | Falsos duplicados por variaciones del nombre | Dedupe por NIT más similitud de objeto, nunca por nombre ni por NIT solo |
 | El modelo «redondea» un valor o infiere una fecha | CA2 en código: un valor distinto de lo extraído no se registra sin confirmación de la analista |
-| Costo sin control | Tope de iteraciones por turno, tope de tokens por sesión, límite de turnos por IP, caché de prompts y costo medido por llamada |
+| Costo sin control | Tope de iteraciones por turno, tope de tokens por sesión y global (`MAX_TOKENS_GLOBAL`, en `out/uso.json`), límite de turnos por IP, caché de prompts y costo medido por llamada |
+| Uso del agente fuera de su propósito | Alcance en el prompt y pausa escalonada por IP (5 min, ×3 por reincidencia, hasta 24 h) con 429 explicativo que no llama al modelo. Si el abuso escala, clasificador previo de entrada |
+| Inyección de fórmulas en el CSV del maestro | Todo texto que Excel leería como fórmula (`=`, `+`, `-`, `@`, tabulador, retorno) se neutraliza con un apóstrofo al escribir |
 | Inyección de instrucciones dentro de un contrato o correo | El prompt trata el contenido como dato; aunque el modelo obedezca, el código impide registrar un dato dudoso sin confirmación en un turno posterior |
 | Fallos del proveedor | Turno atómico con rollback, timeout configurable, errores traducidos al español y respaldo del servidor |
 | Estado global de `out/` en el link público | Botón «Reiniciar demo»; en producción, estado por usuario y base de datos |

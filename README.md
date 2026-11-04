@@ -29,7 +29,11 @@ Sin clave se puede levantar con `LLM_PROVEEDOR=simulado`: el chat responde, pero
 | `LLM_TIMEOUT_MS` | `90000` | Tiempo máximo de espera al proveedor |
 | `MAX_ITERACIONES` | `25` | Tope de idas modelo → herramientas por turno (CA1) |
 | `MAX_TOKENS_SESION` | `600000` | Tope de tokens de entrada y salida por sesión (costo) |
+| `MAX_TOKENS_GLOBAL` | `3000000` | Tope de tokens del motor sumando todas las sesiones; se persiste en `out/uso.json` |
 | `LIMITE_TURNOS_HORA` | `40` | Turnos por IP y por hora en la API pública |
+| `ENFRIAMIENTO_UMBRAL` | `6` | Turnos seguidos sin herramientas desde una IP antes de pausarla (0 la desactiva) |
+| `ENFRIAMIENTO_MINUTOS` | `5` | Minutos de la primera pausa; cada reincidencia la triplica |
+| `ENFRIAMIENTO_MAXIMO_MINUTOS` | `1440` | Techo de la pausa (24 h) |
 | `PORT` | `3000` | Puerto HTTP |
 | `TZ` | `America/Bogota` | Solo para los timestamps de los logs; ninguna regla usa el reloj |
 | `BUZON_DIR` | `fixtures/reto-02/buzon` | Opcional: otro buzón para probar casos nuevos |
@@ -57,12 +61,13 @@ Cierra con las alertas para `hoy = 2026-09-03` y el estado final: maestro con 11
 ## Pruebas
 
 ```bash
-npm test             # 97 pruebas (node:test), sin clave ni red
+npm test             # 151 pruebas (node:test), sin clave ni red
 npm run typecheck    # tsc --noEmit, modo strict
 npm run cobertura    # cobertura con la herramienta de Node
+npm run modulo       # regenera modulo/ (prompt, conocimiento y herramientas empaquetadas)
 ```
 
-Cobertura medida: 95 % de líneas, 85 % de ramas y 93 % de funciones. Las reglas de negocio (`src/tools/`) están entre 97 % y 100 %. El adaptador de Anthropic (66 %) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
+Cobertura medida: 96,87 % de líneas, 87,33 % de ramas y 95,98 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
 
 ## API
 
@@ -98,4 +103,4 @@ Cambiar una regla de negocio toca `src/tools/reglas.ts` o el conocimiento, no el
 
 - [`SOLUCION.md`](SOLUCION.md): planteamiento de la solución (11 secciones del PRD §9.1).
 - [`openspec/`](openspec/): propuesta, especificación, diseño, tareas y la revisión del PRD hecha antes de programar.
-- [`modulo/`](modulo/): bonus §9.4, el agente empaquetado y generado desde las mismas fuentes.
+- [`modulo/`](modulo/): bonus §9.4, el agente empaquetado y generado desde las mismas fuentes. `npm run modulo` empaqueta las herramientas con esbuild en `modulo/tools/contratos.js` (solo requiere `zod`); las pruebas comparan ese archivo con el regenerado.

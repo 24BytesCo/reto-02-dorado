@@ -1,8 +1,8 @@
 /**
- * Herramientas `contratos_*` del agente, listas para otras plataformas.
+ * Punto de entrada TypeScript de las herramientas `contratos_*` para quien use este repo.
  *
- * No es una copia: reexporta las mismas herramientas que usa la aplicación
- * (`src/tools/contratos.ts`), así que cualquier cambio allá llega aquí sin
- * regenerar nada. Se importan sin levantar el servidor Express ni el modelo.
+ * Reexporta las mismas herramientas que usa la aplicación (`src/tools/contratos.ts`).
+ * Para otras plataformas, sin este repositorio, está `contratos.js`: la misma
+ * fuente empaquetada y autónoma (solo requiere zod), generada con `npm run modulo`.
  */
 export * from "../../src/tools/contratos.ts";

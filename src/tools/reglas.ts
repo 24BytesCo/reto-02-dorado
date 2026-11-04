@@ -29,3 +29,13 @@ export const PAISES = ["CO", "EC", "PE", "PA", "HN"] as const;
 export const MONEDAS = ["COP", "USD", "PEN", "PAB", "HNL"] as const;
 export type Pais = (typeof PAISES)[number];
 export type Moneda = (typeof MONEDAS)[number];
+
+/**
+ * Campos que salen del texto del contrato y entran en la regla de confianza (RN5).
+ * `comercial` no está: un remitente desconocido se reporta pero no bloquea (HU-3).
+ */
+export const CAMPOS_CON_CONFIANZA = [
+  "id_contrato", "cliente", "nit_cliente", "pais", "objeto", "valor", "moneda",
+  "fecha_inicio", "fecha_fin", "requiere_poliza", "tipo_poliza",
+] as const;
+export type CampoConConfianza = (typeof CAMPOS_CON_CONFIANZA)[number];

@@ -357,7 +357,7 @@ function extraerPoliza(texto: string, tipo: TipoDocumento): Poliza {
 
 const PATRON_ID = /([A-Z]{2,4}-\d{4}-\d{1,4})/;
 
-/** Número del contrato; en un otrosí, el del contrato que modifica («AL CONTRATO … No. CT-2026-011»). */
+/** Número del contrato; en un otrosí, el del contrato que modifica («AL CONTRATO … No. XX-AAAA-NNN»). */
 function extraerId(texto: string, tipo: TipoDocumento): Campo<string> {
   const plano = texto.replace(/\s+/g, " ");
   const patron = tipo === "otrosi"

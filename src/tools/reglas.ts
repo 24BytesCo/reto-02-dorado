@@ -1,0 +1,31 @@
+/**
+ * Parámetros de negocio del proceso de registro de contratos.
+ * Viven aquí, junto a las herramientas, para que cambiar una regla no toque el servidor (PRD §6.5).
+ */
+export const REGLAS = {
+  /** RN5: un campo con confianza menor a este umbral exige revisión humana. */
+  umbralConfianza: 0.8,
+  /** RN2: similitud mínima de objeto para tratar dos contratos del mismo NIT como el mismo. */
+  similitudObjeto: 0.9,
+  /** HU-5: ventana de alerta de vencimiento, en días. */
+  diasAlertaVencimiento: 60,
+  /** HU-5: fecha de corte del maestro congelado. */
+  fechaCorte: "2026-05-30",
+  /** NIT de Periferia: aparece en todos los contratos como contratista y nunca es el cliente. */
+  nitPropio: "900123456",
+} as const;
+
+/** Columnas del maestro en el orden exacto del fixture (PRD §7.2). */
+export const COLUMNAS_MAESTRO = [
+  "id_contrato", "cliente", "nit_cliente", "pais", "objeto", "valor", "moneda",
+  "fecha_inicio", "fecha_fin", "requiere_poliza", "tipo_poliza", "estado_poliza",
+  "comercial", "ruta_sharepoint", "fecha_registro", "fuente",
+] as const;
+
+export type Columna = (typeof COLUMNAS_MAESTRO)[number];
+export type FilaMaestro = Record<Columna, string>;
+
+export const PAISES = ["CO", "EC", "PE", "PA", "HN"] as const;
+export const MONEDAS = ["COP", "USD", "PEN", "PAB", "HNL"] as const;
+export type Pais = (typeof PAISES)[number];
+export type Moneda = (typeof MONEDAS)[number];

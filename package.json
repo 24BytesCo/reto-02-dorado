@@ -13,7 +13,8 @@
     "demo": "tsx demo.ts",
     "test": "node --import tsx --test tests/*.test.ts",
     "modulo": "tsx scripts/generar-modulo.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "cobertura": "node --import tsx --test --experimental-test-coverage --test-coverage-exclude=tests/** tests/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.4.0",

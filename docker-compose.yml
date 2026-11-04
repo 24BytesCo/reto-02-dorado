@@ -1,0 +1,13 @@
+# Uso local: docker compose up --build  →  http://localhost:3000
+# El puerto se publica solo en 127.0.0.1. Las variables se leen de .env (ver .env.example).
+services:
+  app:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - salida:/app/out
+    restart: unless-stopped
+volumes:
+  salida:

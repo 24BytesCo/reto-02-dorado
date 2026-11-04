@@ -75,7 +75,7 @@ function numerosDe(texto: string): Set<string> {
   return new Set((texto.match(/\d[\d.,']*\d|\d/g) ?? []).map((n) => n.replace(/\D/g, "")));
 }
 
-/** Fechas del texto en AAAA-MM-DD, escritas así o como DD/MM/AAAA. */
+/** Fechas del texto en YYYY-MM-DD, escritas así o como DD/MM/YYYY. */
 function fechasDe(texto: string): Set<string> {
   const iso = texto.match(/\d{4}-\d{2}-\d{2}/g) ?? [];
   const dma = [...texto.matchAll(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/g)].map((m) => `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`);

@@ -10,8 +10,8 @@ import { REGLAS, type FilaMaestro } from "./reglas.ts";
 export const argsAlertas = {
   hoy: z
     .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/, "formato esperado AAAA-MM-DD")
-    .describe("Fecha de referencia del reporte en formato AAAA-MM-DD, p. ej. 2026-09-03; se pasa como argumento para que el resultado sea determinista"),
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "formato esperado YYYY-MM-DD")
+    .describe("Fecha de referencia del reporte en formato YYYY-MM-DD, p. ej. 2026-09-03; se pasa como argumento para que el resultado sea determinista"),
 };
 
 /** Contrato que vence dentro de la ventana de alerta (HU-5, sección 1). */
@@ -37,7 +37,7 @@ const MS_DIA = 86_400_000;
 
 /** Valida `hoy` como fecha real del calendario; "2026-02-31" da un error legible (HU-6). */
 function validarHoy(hoy: string): void {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(hoy)) throw new Error(`la fecha de referencia «${hoy}» no tiene el formato AAAA-MM-DD`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(hoy)) throw new Error(`la fecha de referencia «${hoy}» no tiene el formato YYYY-MM-DD`);
   const [a, m, d] = hoy.split("-").map(Number);
   try {
     fechaIso(a, m, d);
@@ -136,7 +136,7 @@ function renderizar(hoy: string, r: Omit<ResultadoAlertas, "ruta" | "resumen">):
  * Genera el reporte de riesgos para gerencia (HU-5): vencimientos en la ventana, pólizas
  * pendientes y registros desde el corte. Lee la copia del maestro en `out/` (RN6) y escribe
  * `out/alertas.md`. Es determinista: todo se calcula desde `hoy`, sin reloj (regla 11).
- * @param hoy fecha de referencia AAAA-MM-DD; debe existir en el calendario.
+ * @param hoy fecha de referencia YYYY-MM-DD; debe existir en el calendario.
  * @throws Error legible si `hoy` es inválida (HU-6).
  */
 export function generarAlertas(ctx: Contexto, hoy: string): ResultadoAlertas {

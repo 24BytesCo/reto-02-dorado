@@ -589,11 +589,11 @@ import fs3 from "node:fs";
 import path4 from "node:path";
 import { z as z3 } from "zod";
 var argsAlertas = {
-  hoy: z3.string().regex(/^\d{4}-\d{2}-\d{2}$/, "formato esperado AAAA-MM-DD").describe("Fecha de referencia del reporte en formato AAAA-MM-DD, p. ej. 2026-09-03; se pasa como argumento para que el resultado sea determinista")
+  hoy: z3.string().regex(/^\d{4}-\d{2}-\d{2}$/, "formato esperado YYYY-MM-DD").describe("Fecha de referencia del reporte en formato YYYY-MM-DD, p. ej. 2026-09-03; se pasa como argumento para que el resultado sea determinista")
 };
 var MS_DIA = 864e5;
 function validarHoy(hoy) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(hoy)) throw new Error(`la fecha de referencia \xAB${hoy}\xBB no tiene el formato AAAA-MM-DD`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(hoy)) throw new Error(`la fecha de referencia \xAB${hoy}\xBB no tiene el formato YYYY-MM-DD`);
   const [a, m, d] = hoy.split("-").map(Number);
   try {
     fechaIso(a, m, d);
@@ -887,8 +887,10 @@ function clasificar(e) {
 
 // src/tools/contratos.ts
 var mensajeId = z5.string().regex(/^[\w-]+$/).describe("Id del mensaje del buz\xF3n, tal como lo devuelve contratos_leer_buzon");
-function protegido(logica) {
+function protegido(args, ctx, logica) {
   return seguro(() => {
+    if (typeof args !== "object" || args === null) throw new Error("argumentos inv\xE1lidos: se esperaba un objeto");
+    if (typeof ctx !== "object" || ctx === null || typeof ctx.directory !== "string") throw new Error("contexto inv\xE1lido: falta directory");
     try {
       return logica();
     } catch (e) {
@@ -899,7 +901,7 @@ function protegido(logica) {
 var extraer = {
   description: "Extrae del contrato adjunto a un mensaje los datos del maestro con una confianza entre 0 y 1 por campo; un campo ausente viene en null, nunca inventado.",
   args: { mensaje_id: mensajeId },
-  execute: (args, ctx) => protegido(() => {
+  execute: (args, ctx) => protegido(args, ctx, () => {
     const { mensaje_id } = args;
     const e = extraccionDeMensaje(ctx, mensaje_id);
     const bajos = CAMPOS_CON_CONFIANZA.filter((k) => e.contrato[k].valor !== null && e.contrato[k].confianza < REGLAS.umbralConfianza);
@@ -921,7 +923,7 @@ function mensajeDelBuzon(ctx, id) {
 var leer_buzon = {
   description: "Lista los mensajes del buz\xF3n que a\xFAn no se han procesado, con remitente, asunto, fecha, adjuntos y si traen contrato.",
   args: {},
-  execute: (_args, ctx) => protegido(() => {
+  execute: (args, ctx) => protegido(args ?? {}, ctx, () => {
     const procesados = leerProcesados(ctx);
     const mensajes = listarMensajes(ctx).filter((id) => !(id in procesados)).map((id) => mensajeDelBuzon(ctx, id));
     return ok({ mensajes, resumen: `${mensajes.length} mensajes pendientes` });
@@ -946,7 +948,7 @@ var idDe = (r) => r.id_contrato_existente ?? (r.propuesta?.id_contrato || null);
 var validar = {
   description: "Clasifica el contrato de un mensaje como nuevo, actualizacion, duplicado o rechazado frente al maestro, con los campos que requieren revisi\xF3n humana y la fila que se escribir\xEDa; no escribe nada.",
   args: { mensaje_id: mensajeId, contrato },
-  execute: (args, ctx) => protegido(() => {
+  execute: (args, ctx) => protegido(args, ctx, () => {
     const { mensaje_id, contrato: corregido } = args;
     const { resultado: r } = evaluar(ctx, mensaje_id, corregido ?? {});
     const sobre = r.id_contrato_existente ? ` sobre ${r.id_contrato_existente}` : "";
@@ -999,7 +1001,7 @@ var registrar = {
     contrato,
     confirmado: z5.boolean().optional().describe("true solo si la analista confirm\xF3 en un mensaje propio los campos en revisi\xF3n")
   },
-  execute: (args, ctx) => protegido(() => {
+  execute: (args, ctx) => protegido(args, ctx, () => {
     const { mensaje_id, contrato: corregido, confirmado } = args;
     const ev = evaluar(ctx, mensaje_id, corregido ?? {});
     const revision = ev.resultado.requiere_revision;
@@ -1015,7 +1017,7 @@ var registrar = {
 var alertas = {
   description: "Genera out/alertas.md con los contratos que vencen en 60 d\xEDas o menos desde \xABhoy\xBB, las p\xF3lizas exigidas que no est\xE1n vigentes y los contratos registrados desde el corte del 2026-05-30.",
   args: argsAlertas,
-  execute: (args, ctx) => protegido(() => ok(generarAlertas(ctx, args.hoy)))
+  execute: (args, ctx) => protegido(args, ctx, () => ok(generarAlertas(ctx, args.hoy)))
 };
 export {
   alertas,

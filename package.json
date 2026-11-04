@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Agente conversacional de registro de contratos vigentes — Reto técnico 02, Periferia IT Group",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "scripts": {
     "dev": "tsx src/server.ts",

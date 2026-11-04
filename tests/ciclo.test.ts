@@ -206,7 +206,9 @@ test("una clave del proveedor en un error nunca llega a la respuesta ni a los ev
   const { motor } = preparar([new Error(`falló con la clave ${PREFIJO}api03-abcDEF_123-xyz`)]);
   const r = await motor.turno(SESION, "hola", (e) => eventos.push(e));
   assert.doesNotMatch(r.reply, CON_CLAVE);
-  assert.match(r.reply, /\[clave oculta\]/);
+  // Un error que no es del proveedor no expone su detalle técnico: el chat recibe un texto claro y la sesión sigue.
+  assert.match(r.reply, /No pude completar este paso.*La sesión sigue activa/s);
+  assert.doesNotMatch(r.reply, /api03|abcDEF/);
   assert.doesNotMatch(JSON.stringify(eventos), CON_CLAVE);
   const traducido = traducir(Anthropic.APIError.generate(400, { error: { message: `mal ${PREFIJO}xxx` } }, `mal ${PREFIJO}xxx`, new Headers()));
   assert.doesNotMatch(traducido.message, CON_CLAVE);
@@ -244,4 +246,13 @@ test("la fábrica elige el adaptador por LLM_PROVEEDOR; el simulado sin guion ex
   assert.match((await simulado.enviar("", [], [])).texto, /No hay un modelo/);
   assert.equal(crearAdaptador({ LLM_MODELO: "claude-sonnet-5-5" }).modelo, "claude-sonnet-5-5");
   assert.throws(() => crearAdaptador({ LLM_PROVEEDOR: "otro" }), /LLM_PROVEEDOR desconocido/);
+});
+
+test("el reinicio de la demo no pone en cero el tope global de tokens (PRD §8 Costo)", async () => {
+  const { motor, ctx } = preparar([respuestaTexto("hola", { entrada: 100, salida: 10, cacheLeida: 0 })]);
+  await motor.turno(SESION, "hola");
+  fs.rmSync(path.join(ctx.directory, "out"), { recursive: true, force: true });
+  motor.reiniciar();
+  const uso = JSON.parse(fs.readFileSync(path.join(ctx.directory, "out", "uso.json"), "utf8")) as { tokens: number };
+  assert.equal(uso.tokens, 110);
 });

@@ -25,8 +25,10 @@ const mensajeId = z.string().regex(/^[\w-]+$/).describe("Id del mensaje del buz�
  * `seguro` con dos garantías más (PRD §6.2 «nunca lanza», §8): los argumentos se leen DENTRO del try, así que
  * `args` undefined o null da `{ ok: false }` y no una excepción; y el error sale sin rutas absolutas del servidor.
  */
-function protegido(logica: () => string): Promise<string> {
+function protegido(args: unknown, ctx: unknown, logica: () => string): Promise<string> {
   return seguro(() => {
+    if (typeof args !== "object" || args === null) throw new Error("argumentos inválidos: se esperaba un objeto");
+    if (typeof ctx !== "object" || ctx === null || typeof (ctx as Partial<Contexto>).directory !== "string") throw new Error("contexto inválido: falta directory");
     try {
       return logica();
     } catch (e) {
@@ -41,7 +43,7 @@ export const extraer: Herramienta<{ mensaje_id: typeof mensajeId }> = {
   description: "Extrae del contrato adjunto a un mensaje los datos del maestro con una confianza entre 0 y 1 por campo; un campo ausente viene en null, nunca inventado.",
   args: { mensaje_id: mensajeId },
   execute: (args, ctx) =>
-    protegido(() => {
+    protegido(args, ctx, () => {
       const { mensaje_id } = args;
       const e = extraccionDeMensaje(ctx, mensaje_id);
       const bajos = CAMPOS_CON_CONFIANZA.filter((k) => e.contrato[k].valor !== null && e.contrato[k].confianza < REGLAS.umbralConfianza);
@@ -81,8 +83,8 @@ function mensajeDelBuzon(ctx: Contexto, id: string): MensajeBuzon {
 export const leer_buzon: Herramienta<{}> = {
   description: "Lista los mensajes del buzón que aún no se han procesado, con remitente, asunto, fecha, adjuntos y si traen contrato.",
   args: {},
-  execute: (_args, ctx) =>
-    protegido(() => {
+  execute: (args, ctx) =>
+    protegido(args ?? {}, ctx, () => {
       const procesados = leerProcesados(ctx);
       const mensajes = listarMensajes(ctx).filter((id) => !(id in procesados)).map((id) => mensajeDelBuzon(ctx, id));
       return ok({ mensajes, resumen: `${mensajes.length} mensajes pendientes` });
@@ -129,7 +131,7 @@ export const validar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: type
   description: "Clasifica el contrato de un mensaje como nuevo, actualizacion, duplicado o rechazado frente al maestro, con los campos que requieren revisión humana y la fila que se escribiría; no escribe nada.",
   args: { mensaje_id: mensajeId, contrato },
   execute: (args, ctx) =>
-    protegido(() => {
+    protegido(args, ctx, () => {
       const { mensaje_id, contrato: corregido } = args;
       const { resultado: r } = evaluar(ctx, mensaje_id, corregido ?? {});
       const sobre = r.id_contrato_existente ? ` sobre ${r.id_contrato_existente}` : "";
@@ -221,7 +223,7 @@ export const registrar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: ty
     confirmado: z.boolean().optional().describe("true solo si la analista confirmó en un mensaje propio los campos en revisión"),
   },
   execute: (args, ctx) =>
-    protegido(() => {
+    protegido(args, ctx, () => {
       const { mensaje_id, contrato: corregido, confirmado } = args;
       const ev = evaluar(ctx, mensaje_id, corregido ?? {});
       const revision = ev.resultado.requiere_revision;
@@ -239,5 +241,5 @@ export const registrar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: ty
 export const alertas: Herramienta<typeof argsAlertas> = {
   description: "Genera out/alertas.md con los contratos que vencen en 60 días o menos desde «hoy», las pólizas exigidas que no están vigentes y los contratos registrados desde el corte del 2026-05-30.",
   args: argsAlertas,
-  execute: (args, ctx) => protegido(() => ok(generarAlertas(ctx, args.hoy))),
+  execute: (args, ctx) => protegido(args, ctx, () => ok(generarAlertas(ctx, args.hoy))),
 };

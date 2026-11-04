@@ -102,6 +102,7 @@ export function limpiarSalida(ctx: Contexto): void {
 
 // ── Procesados, historial y archivo ──
 
+/** Entrada de `out/procesados.json`: cómo terminó un mensaje del buzón (HU-1, HU-4). */
 export interface Procesado {
   accion: string;
   id_contrato: string | null;
@@ -148,9 +149,11 @@ const Correo = z.object({
   cuerpo: z.string().optional(),
   adjuntos: z.array(z.string()),
 });
+/** Un `correo.json` del buzón ya validado (PRD §7.1). */
 export type Correo = z.infer<typeof Correo>;
 
 const Comerciales = z.array(z.object({ email: z.string(), nombre: z.string(), region: z.string() }));
+/** Una entrada de `comerciales.json` (PRD §7.1). */
 export type Comercial = z.infer<typeof Comerciales>[number];
 
 /** Ids de los mensajes del buzón, en orden. */

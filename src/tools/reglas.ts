@@ -22,12 +22,18 @@ export const COLUMNAS_MAESTRO = [
   "comercial", "ruta_sharepoint", "fecha_registro", "fuente",
 ] as const;
 
+/** Nombre de una columna del maestro. */
 export type Columna = (typeof COLUMNAS_MAESTRO)[number];
+/** Una fila del maestro, con todas las columnas como texto (PRD §7.2). */
 export type FilaMaestro = Record<Columna, string>;
 
+/** Países admitidos en el maestro (PRD §7.2). */
 export const PAISES = ["CO", "EC", "PE", "PA", "HN"] as const;
+/** Monedas admitidas en el maestro (PRD §7.2). */
 export const MONEDAS = ["COP", "USD", "PEN", "PAB", "HNL"] as const;
+/** Código de país del maestro. */
 export type Pais = (typeof PAISES)[number];
+/** Código de moneda del maestro. */
 export type Moneda = (typeof MONEDAS)[number];
 
 /**
@@ -38,4 +44,5 @@ export const CAMPOS_CON_CONFIANZA = [
   "id_contrato", "cliente", "nit_cliente", "pais", "objeto", "valor", "moneda",
   "fecha_inicio", "fecha_fin", "requiere_poliza", "tipo_poliza",
 ] as const;
+/** Campo del contrato sujeto a la regla de confianza (RN5). */
 export type CampoConConfianza = (typeof CAMPOS_CON_CONFIANZA)[number];

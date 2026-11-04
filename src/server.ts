@@ -105,7 +105,6 @@ function enviarEvento(res: Response, nombre: string, datos: unknown): void {
   escribir(res, `event: ${nombre}\ndata: ${JSON.stringify(datos)}\n\n`);
 }
 
-/** Resultado de respaldo si el motor llegara a lanzar (su contrato dice que no): la sesión no muere (CA5). */
 /** Aviso previo a la pausa (desde el segundo mensaje seguido sin trabajo): cuántos van y qué pasa al llegar al umbral. */
 function avisoPrevio(seguidos: number, umbral: number, minutosBase: number): string | undefined {
   if (umbral <= 0 || seguidos < 2 || seguidos >= umbral) return undefined;
@@ -118,6 +117,7 @@ function mensajePausa(segundos: number): string {
   return `Esta herramienta es solo para el registro de contratos. Por varios mensajes seguidos fuera de ese propósito, esta conexión queda en pausa ${minutos} min. Después podrás procesar el buzón, revisar un contrato o generar las alertas.`;
 }
 
+/** Resultado de respaldo si el motor llegara a lanzar (su contrato dice que no): la sesión no muere (CA5). */
 function resultadoDeError(): ResultadoTurno {
   return { reply: MENSAJES.interno, toolCalls: [], needsConfirmation: false, pendientes: [] };
 }
@@ -130,12 +130,13 @@ async function turnoSeguro(motor: MotorAgente, sessionId: string, message: strin
   }
 }
 
+/** Decora el resultado del turno antes de enviarlo (hoy: el aviso previo a la pausa). */
+type Decorar = (resultado: ResultadoTurno) => ResultadoTurno;
+
 /**
  * Responde el turno como stream SSE: un evento por cada `EventoAgente`, latido periódico y un `fin` con el resultado.
  * Si el navegador se desconecta, el turno se completa igual y queda en la sesión.
  */
-type Decorar = (resultado: ResultadoTurno) => ResultadoTurno;
-
 async function responderStream(res: Response, motor: MotorAgente, sessionId: string, message: string, latidoMs: number, decorar: Decorar): Promise<ResultadoTurno> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",

@@ -56,7 +56,7 @@ test("HU-5: determinista, dos llamadas con el mismo hoy dan el mismo archivo", (
 test("HU-5 / HU-6: hoy inválido da un error legible", () => {
   const ctx = proyectoTemporal();
   assert.throws(() => generarAlertas(ctx, "2026-02-31"), /no existe en el calendario/);
-  assert.throws(() => generarAlertas(ctx, "3/9/2026"), /AAAA-MM-DD/);
+  assert.throws(() => generarAlertas(ctx, "3/9/2026"), /YYYY-MM-DD/);
 });
 
 test("RN6: lee la copia de out/, no el fixture", () => {

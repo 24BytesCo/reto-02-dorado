@@ -32,6 +32,7 @@ const recortar = (s: string, max: number): string => {
 
 // ── Tipo de documento ──
 
+/** Clase de documento contractual que reconoce el extractor (HU-1). */
 export type TipoDocumento = "contrato" | "otrosi";
 
 /** Cuántas líneas no vacías se revisan buscando el título: un membrete puede ir antes. */
@@ -456,6 +457,7 @@ function extraerId(texto: string, tipo: TipoDocumento): Campo<string> {
 
 // ── Extracción completa ──
 
+/** Campos del contrato tal como salen del texto, cada uno con su confianza (HU-2). */
 export interface ContratoExtraido {
   id_contrato: Campo<string>;
   cliente: Campo<string>;
@@ -470,6 +472,7 @@ export interface ContratoExtraido {
   tipo_poliza: Campo<string>;
 }
 
+/** Resultado de `extraerContrato`: tipo de documento, campos con confianza y advertencias (HU-2). */
 export interface Extraccion {
   tipo_documento: TipoDocumento;
   numero_otrosi: number | null;

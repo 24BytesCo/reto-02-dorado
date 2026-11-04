@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import * as contratos from "../tools/contratos.ts";
-import { catalogo, dirSalida, ejecutarHerramienta, fallo, type Contexto, type HerramientaRegistrada } from "../tools/nucleo.ts";
+import { anotarLog, catalogo, dirSalida, ejecutarHerramienta, fallo, resumir, type Contexto, type HerramientaRegistrada } from "../tools/nucleo.ts";
 import { crearAdaptador, type AdaptadorLlm, type DefinicionHerramienta, type LlamadaHerramienta, type Mensaje, type OpcionesEnvio, type Respuesta, type ResultadoHerramienta, type Uso } from "../llm/adapter.ts";
 import { ErrorLlm, redactar } from "../llm/errores.ts";
 import { actualizarPendientes, decidirConfirmacion, mensajeIdDe } from "./confirmacion.ts";
@@ -76,21 +76,11 @@ function aDefinicion(reg: HerramientaRegistrada): DefinicionHerramienta {
   return { nombre: reg.nombre, descripcion: reg.herramienta.description, esquema };
 }
 
-/** `ok` y un resumen corto de un resultado de herramienta, para el chat y los eventos (PRD §6.1). */
-function resumir(contenido: string): { ok: boolean; resumen: string } {
-  try {
-    const r = JSON.parse(contenido) as { ok?: unknown; data?: { resumen?: unknown }; error?: unknown };
-    if (r.ok !== true) return { ok: false, resumen: String(r.error).slice(0, 200) };
-    const propio = r.data?.resumen;
-    return { ok: true, resumen: typeof propio === "string" ? propio : JSON.stringify(r.data ?? null).slice(0, 200) };
-  } catch {
-    return { ok: false, resumen: contenido.slice(0, 200) };
-  }
-}
-
 /** Mensaje claro para la analista ante cualquier fallo del turno (CA5); siempre redactado. */
 function mensajeDeError(error: unknown): string {
-  const causa = error instanceof ErrorLlm ? error.message : `error interno del agente: ${error instanceof Error ? error.message : String(error)}`;
+  // El detalle técnico (rutas, códigos de Node) se queda en el servidor; a la analista le llega un texto sin jerga.
+  if (!(error instanceof ErrorLlm)) console.error(`[motor] ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+  const causa = error instanceof ErrorLlm ? error.message : "error interno del agente al leer o escribir los archivos de trabajo.";
   return redactar(`No pude completar este paso: ${causa} La sesión sigue activa; puedes volver a intentarlo.`);
 }
 
@@ -165,6 +155,11 @@ class Motor implements MotorAgente {
   /** Suma el uso de una llamada al contador global y lo persiste (PRD §8 Costo). */
   private sumarUso(uso: Uso): void {
     this.tokensGlobales += uso.entrada + uso.salida;
+    this.guardarUso();
+  }
+
+  /** Escribe `out/uso.json`; también tras un reinicio de la demo, para que el tope global sobreviva a un reinicio del proceso. */
+  private guardarUso(): void {
     fs.mkdirSync(this.salida(), { recursive: true });
     fs.writeFileSync(path.join(this.salida(), "uso.json"), JSON.stringify({ tokens: this.tokensGlobales, actualizado: new Date().toISOString() }));
   }
@@ -195,6 +190,8 @@ class Motor implements MotorAgente {
 
   reiniciar(): void {
     this.almacen.reiniciar();
+    // La API vacía out/ antes de llamar aquí: el contador global de tokens no se pierde con la demo.
+    this.guardarUso();
   }
 
   /** Nunca lanza (contrato de MotorAgente): cualquier fallo vuelve como `reply`. */
@@ -326,9 +323,7 @@ class Motor implements MotorAgente {
 
   /** Respuesta `{ ok: false }` sin ejecutar, anotada igual en out/log.jsonl (RN7, CA4). */
   private rechazar(t: EstadoTurno, l: LlamadaHerramienta, error: string): string {
-    const linea = { ts: new Date().toISOString(), herramienta: l.nombre, mensaje_id: mensajeIdDe(l.argumentos), ok: false, resumen: error.slice(0, 200) };
-    fs.mkdirSync(dirSalida(t.ctx), { recursive: true });
-    fs.appendFileSync(path.join(dirSalida(t.ctx), "log.jsonl"), JSON.stringify(linea) + "\n");
+    anotarLog({ ts: new Date().toISOString(), herramienta: l.nombre, mensaje_id: mensajeIdDe(l.argumentos), ok: false, resumen: error.slice(0, 200) }, t.ctx);
     return fallo(error);
   }
 }

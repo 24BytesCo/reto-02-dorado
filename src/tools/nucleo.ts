@@ -69,12 +69,16 @@ export function dirSalida(ctx: Contexto): string {
   return path.resolve(ctx.directory, process.env.OUT_DIR ?? "out");
 }
 
-/** Resumen corto del resultado para el log: el `resumen` que traiga la herramienta o el inicio del JSON. */
-function resumir(resultado: string): { ok: boolean; resumen: string } {
-  const r = JSON.parse(resultado) as { ok: boolean; data?: { resumen?: unknown }; error?: string };
-  if (!r.ok) return { ok: false, resumen: String(r.error).slice(0, 200) };
-  const propio = r.data?.resumen;
-  return { ok: true, resumen: typeof propio === "string" ? propio : JSON.stringify(r.data).slice(0, 200) };
+/** `ok` y un resumen corto de un resultado de herramienta: el `resumen` que traiga o el inicio del JSON (log y chat). */
+export function resumir(resultado: string): { ok: boolean; resumen: string } {
+  try {
+    const r = JSON.parse(resultado) as { ok?: unknown; data?: { resumen?: unknown }; error?: unknown };
+    if (r.ok !== true) return { ok: false, resumen: String(r.error).slice(0, 200) };
+    const propio = r.data?.resumen;
+    return { ok: true, resumen: typeof propio === "string" ? propio : JSON.stringify(r.data ?? null).slice(0, 200) };
+  } catch {
+    return { ok: false, resumen: resultado.slice(0, 200) };
+  }
 }
 
 /**
@@ -95,8 +99,8 @@ export async function ejecutarHerramienta(reg: HerramientaRegistrada, entrada: u
   return resultado;
 }
 
-/** Agrega una línea a `out/log.jsonl`; si no se puede escribir avisa por stderr y no tumba la herramienta. */
-function anotarLog(linea: unknown, ctx: Contexto): void {
+/** Agrega una línea a `out/log.jsonl` (RN7); si no se puede escribir avisa por stderr y no tumba la herramienta. */
+export function anotarLog(linea: unknown, ctx: Contexto): void {
   try {
     fs.mkdirSync(dirSalida(ctx), { recursive: true });
     fs.appendFileSync(path.join(dirSalida(ctx), "log.jsonl"), JSON.stringify(linea) + "\n");

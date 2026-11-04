@@ -7,18 +7,20 @@ Agente conversacional que actúa como punto único de recepción de contratos: l
 
 ## Levantar en local
 
-Requiere Node 22 (el PRD admite Node 20+).
+Requiere Node 20.12 o mayor (`engines` del `package.json`); la imagen de Docker usa Node 22. `npm run cobertura` necesita Node 22.5 o mayor.
 
 ```bash
-cp .env.example .env          # poner ANTHROPIC_API_KEY
+cp .env.example .env          # poner ANTHROPIC_API_KEY; lo demás vacío toma su valor por defecto
 npm install && npm run dev    # http://localhost:3000
 ```
 
 Alternativa con Docker: `docker compose up --build` (lee `.env` y publica solo en `127.0.0.1:3000`).
 
-Sin clave se puede levantar con `LLM_PROVEEDOR=simulado`: el chat responde, pero sin modelo real.
+Sin clave se puede levantar con `LLM_PROVEEDOR=simulado`: el chat responde, pero sin modelo real (y la pausa por uso fuera de propósito queda desactivada, salvo que `ENFRIAMIENTO_UMBRAL` la fije).
 
 ## Variables (`.env.example`)
+
+El `.env.example` trae las variables sin valores (PRD §6.5), salvo `LLM_PROVEEDOR=anthropic`, porque el adaptador no acepta el proveedor vacío. Una variable vacía toma el valor de esta tabla.
 
 | Variable | Por defecto | Para qué |
 |---|---|---|
@@ -31,11 +33,12 @@ Sin clave se puede levantar con `LLM_PROVEEDOR=simulado`: el chat responde, pero
 | `MAX_TOKENS_SESION` | `600000` | Tope de tokens de entrada y salida por sesión (costo) |
 | `MAX_TOKENS_GLOBAL` | `3000000` | Tope de tokens del motor sumando todas las sesiones; se persiste en `out/uso.json` |
 | `LIMITE_TURNOS_HORA` | `40` | Turnos por IP y por hora en la API pública |
-| `ENFRIAMIENTO_UMBRAL` | `6` | Turnos seguidos sin herramientas desde una IP antes de pausarla (0 la desactiva) |
+| `ENFRIAMIENTO_UMBRAL` | `12` (`0` con `LLM_PROVEEDOR=simulado`) | Turnos seguidos fuera de propósito desde una IP antes de pausarla (0 la desactiva). Ver «Pausa» abajo |
 | `ENFRIAMIENTO_MINUTOS` | `5` | Minutos de la primera pausa; cada reincidencia la triplica |
 | `ENFRIAMIENTO_MAXIMO_MINUTOS` | `1440` | Techo de la pausa (24 h) |
 | `PORT` | `3000` | Puerto HTTP |
-| `TZ` | `America/Bogota` | Solo para los timestamps de los logs; ninguna regla usa el reloj |
+| `TZ` | `America/Bogota` | La fija el Dockerfile. Solo afecta los timestamps de los logs; ninguna regla usa el reloj |
+| `GIT_SHA` | `local` (`desconocido` en la imagen sin `--build-arg`) | Commit desplegado, que informa `/api/health`. Se pasa al construir: `docker build --build-arg GIT_SHA=$(git rev-parse --short HEAD) .` |
 | `BUZON_DIR` | `fixtures/reto-02/buzon` | Opcional: otro buzón para probar casos nuevos |
 | `OUT_DIR` | `out` | Opcional: otra carpeta de salida, dentro del proyecto |
 
@@ -61,25 +64,29 @@ Cierra con las alertas para `hoy = 2026-09-03` y el estado final: maestro con 11
 ## Pruebas
 
 ```bash
-npm test             # 151 pruebas (node:test), sin clave ni red
+npm test             # 191 pruebas (node:test), sin clave ni red
 npm run typecheck    # tsc --noEmit, modo strict
 npm run cobertura    # cobertura con la herramienta de Node
 npm run modulo       # regenera modulo/ (prompt, conocimiento y herramientas empaquetadas)
 ```
 
-Cobertura medida: 97,02 % de líneas, 87,44 % de ramas y 96,01 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
+Cobertura medida: 97,24 % de líneas, 88,94 % de ramas y 96,16 % de funciones. Las reglas de negocio (`src/tools/`) están entre 98,6 % y 100 % de líneas. El adaptador de Anthropic (84,62 % de líneas) depende de la API real: se verificó con una corrida en vivo del caso completo del §11 (ver `SOLUCION.md`, sección 4).
 
 ## API
 
 | Método | Ruta | Entrada → salida |
 |---|---|---|
-| `POST` | `/api/chat` | `{ sessionId, message }` → `{ reply, toolCalls[], needsConfirmation, pendientes, aviso? }` (`aviso` llega desde el segundo mensaje seguido fuera de propósito) |
+| `POST` | `/api/chat` | `{ sessionId, message }` → `{ reply, toolCalls[], needsConfirmation, pendientes, aviso? }` (`aviso` llega desde el segundo mensaje seguido fuera de propósito). `sessionId`: de 6 a 64 caracteres `[A-Za-z0-9_-]`. `message`: de 1 a 4.000 caracteres |
 | `POST` | `/api/chat` con `Accept: text/event-stream` | Stream SSE: eventos `texto`, `herramienta`, `resultado`, `uso`, `error` y un `fin` con el mismo objeto de arriba. Latido (`: latido`) cada 15 s |
-| `GET` | `/api/sessions/:id` | `{ id, creada, turnos[], tokens }`, o 404 si no existe |
-| `GET` | `/api/health` | `{ ok, provider, model }`, sin claves |
+| `GET` | `/api/sessions/:id` | `{ id, creada, turnos[], tokens }`. 400 si el id no tiene el formato de `sessionId`; 404 si no existe |
+| `GET` | `/api/health` | `{ ok, provider, model, commit }`, sin claves. `commit` dice qué versión corre el link |
 | `POST` | `/api/reset` | Borra `out/` y las sesiones; el buzón vuelve a tener los 6 mensajes. 409 si hay un turno en curso |
 
 `needsConfirmation` y `pendientes` los calcula el servidor, no el modelo. Otros códigos: 400 (cuerpo inválido), 409 (la sesión ya tiene un turno en curso), 413 (más de 32 kb), 429 (límite de turnos por hora, o pausa por uso fuera de propósito; ambos con `Retry-After`).
+
+**Qué trae cada turno de `/api/sessions/:id`:** `{ ts, usuario, reply, toolCalls[], needsConfirmation, pendientes, aviso? }`. Cada elemento de `toolCalls` es `{ id, nombre, argumentos, ok, resumen }`: el resumen del resultado, no el JSON completo. `reply` es el texto final del asistente; los textos intermedios entre herramientas y los resultados completos viven en el historial crudo del proveedor (`out/sesiones/<id>.json`), que no sale por la API para que el navegador no pueda leerlo ni falsificarlo. El resultado completo de cada llamada queda resumido en `out/log.jsonl`.
+
+**Pausa por uso fuera de propósito (PRD §8 Costo).** Un turno cuenta como fuera de propósito solo si el agente no usó herramientas, no quedaron pendientes, no pidió confirmación y el mensaje no trae vocabulario del dominio (`contrato`, `buzón`/`buzon`, `maestro`, `alerta`, `póliza`/`poliza`, `registra`, `confirmo`, `msg-`). Con 12 turnos así seguidos desde una IP (`ENFRIAMIENTO_UMBRAL`), la conexión queda en pausa 5 min; cada reincidencia la triplica hasta 24 h. Desde el segundo turno seguido llega un `aviso` con la cuenta. Un turno con propósito reinicia el contador. Con `LLM_PROVEEDOR=simulado` está desactivada.
 
 ## Estructura
 

@@ -1,5 +1,6 @@
 import path from "node:path";
 import express, { type Express, type NextFunction, type Request, type RequestHandler, type Response } from "express";
+import { crearEnfriamiento, enfriamientoDeEntorno, type OpcionesEnfriamiento } from "./enfriamiento.ts";
 import { z } from "zod";
 import { crearMotor } from "./agent/motor.ts";
 import { errorDeId } from "./agent/sesiones.ts";
@@ -34,6 +35,8 @@ export interface OpcionesApp {
   /** Turnos por IP y hora (`LIMITE_TURNOS_HORA` en el entorno; 40 por defecto). */
   limiteTurnosHora?: number;
   latidoMs?: number;
+  /** Pausa por conversación fuera de propósito; sin valor, desactivada (las pruebas la activan a propósito). */
+  enfriamiento?: OpcionesEnfriamiento;
 }
 
 const MENSAJES = {
@@ -103,6 +106,12 @@ function enviarEvento(res: Response, nombre: string, datos: unknown): void {
 }
 
 /** Resultado de respaldo si el motor llegara a lanzar (su contrato dice que no): la sesión no muere (CA5). */
+/** Aviso de la pausa por uso fuera de propósito: explica para qué sirve la herramienta y cuánto falta. */
+function mensajePausa(segundos: number): string {
+  const minutos = Math.ceil(segundos / 60);
+  return `Esta herramienta es solo para el registro de contratos. Por varios mensajes seguidos fuera de ese propósito, esta conexión queda en pausa ${minutos} min. Después podrás procesar el buzón, revisar un contrato o generar las alertas.`;
+}
+
 function resultadoDeError(): ResultadoTurno {
   return { reply: MENSAJES.interno, toolCalls: [], needsConfirmation: false, pendientes: [] };
 }
@@ -119,7 +128,7 @@ async function turnoSeguro(motor: MotorAgente, sessionId: string, message: strin
  * Responde el turno como stream SSE: un evento por cada `EventoAgente`, latido periódico y un `fin` con el resultado.
  * Si el navegador se desconecta, el turno se completa igual y queda en la sesión.
  */
-async function responderStream(res: Response, motor: MotorAgente, sessionId: string, message: string, latidoMs: number): Promise<void> {
+async function responderStream(res: Response, motor: MotorAgente, sessionId: string, message: string, latidoMs: number): Promise<ResultadoTurno> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
@@ -132,14 +141,17 @@ async function responderStream(res: Response, motor: MotorAgente, sessionId: str
   try {
     const resultado = await turnoSeguro(motor, sessionId, message, (evento) => enviarEvento(res, evento.tipo, evento));
     enviarEvento(res, "fin", resultado);
+    return resultado;
   } finally {
     clearInterval(latido);
     res.end();
   }
 }
 
-async function responderJson(res: Response, motor: MotorAgente, sessionId: string, message: string): Promise<void> {
-  res.json(await turnoSeguro(motor, sessionId, message));
+async function responderJson(res: Response, motor: MotorAgente, sessionId: string, message: string): Promise<ResultadoTurno> {
+  const resultado = await turnoSeguro(motor, sessionId, message);
+  res.json(resultado);
+  return resultado;
 }
 
 /** Error del analizador del cuerpo (`express.json`): JSON roto o más de 32 kb. */
@@ -186,6 +198,7 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   const info = opciones.info ?? infoDeEntorno();
   const latidoMs = opciones.latidoMs ?? LATIDO_MS;
   const limitador = crearLimitador(opciones.limiteTurnosHora ?? LIMITE_TURNOS_HORA, HORA_MS);
+  const enfriamiento = crearEnfriamiento(opciones.enfriamiento ?? { umbral: 0, minutosBase: 1, maximoMinutos: 1 });
   // Una sesión con turno en curso rechaza otro (409): el motor los encadenaría, pero la analista debe saberlo.
   const enCurso = new Set<string>();
 
@@ -200,7 +213,14 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
       res.status(409).json({ error: MENSAJES.ocupada });
       return;
     }
-    const espera = limitador.intentar(req.ip ?? "desconocida");
+    const ip = req.ip ?? "desconocida";
+    const pausa = enfriamiento.bloqueo(ip);
+    if (pausa > 0) {
+      res.set("Retry-After", String(pausa));
+      res.status(429).json({ error: mensajePausa(pausa) });
+      return;
+    }
+    const espera = limitador.intentar(ip);
     if (espera > 0) {
       res.set("Retry-After", String(espera));
       res.status(429).json({ error: `Se alcanzó el límite de turnos por hora desde esta conexión. Vuelve a intentarlo en ${Math.ceil(espera / 60)} min.` });
@@ -208,7 +228,8 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
     }
     enCurso.add(sessionId);
     try {
-      await (pideStream(req) ? responderStream(res, motor, sessionId, message, latidoMs) : responderJson(res, motor, sessionId, message));
+      const resultado = await (pideStream(req) ? responderStream(res, motor, sessionId, message, latidoMs) : responderJson(res, motor, sessionId, message));
+      enfriamiento.registrar(ip, resultado.toolCalls.length > 0);
     } finally {
       enCurso.delete(sessionId);
     }
@@ -279,6 +300,7 @@ function arrancar(): void {
     const app = crearApp(crearMotor({ adaptador, directorio: RAIZ }), RAIZ, {
       info: { provider: adaptador.proveedor, model: adaptador.modelo },
       limiteTurnosHora: limite > 0 ? Math.floor(limite) : undefined,
+      enfriamiento: enfriamientoDeEntorno(),
     });
     const puerto = leerPuerto(process.env.PORT);
     const servidor = app.listen(puerto, () => console.log(`Agente de registro de contratos en http://localhost:${puerto} (${adaptador.proveedor}/${adaptador.modelo})`));

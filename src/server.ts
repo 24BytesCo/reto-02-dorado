@@ -272,7 +272,13 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   app.use("/api", (_req, res) => {
     res.status(404).json({ error: MENSAJES.noEncontrada });
   });
-  app.use(express.static(DIR_WEB));
+  // `no-transform` en el HTML: Cloudflare no inyecta su script en línea de detección de bots, que la CSP
+  // estricta bloquearía (documentación de JavaScript Detections). Así no hace falta abrir 'unsafe-inline'.
+  app.use(express.static(DIR_WEB, {
+    setHeaders: (res, ruta) => {
+      if (ruta.endsWith(".html")) res.setHeader("Cache-Control", "no-cache, no-transform");
+    },
+  }));
   app.use(manejarErrores);
   return app;
 }

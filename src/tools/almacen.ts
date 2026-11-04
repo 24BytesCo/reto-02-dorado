@@ -1,0 +1,167 @@
+import fs from "node:fs";
+import path from "node:path";
+import { z } from "zod";
+import { dirSalida, type Contexto } from "./nucleo.ts";
+import { COLUMNAS_MAESTRO, type FilaMaestro } from "./reglas.ts";
+
+/** Rutas de entrada (solo lectura) y de salida, resueltas desde `ctx.directory`. */
+export function rutas(ctx: Contexto) {
+  const fixtures = path.resolve(ctx.directory, "fixtures/reto-02");
+  const out = dirSalida(ctx);
+  const sharepoint = path.join(out, "sharepoint");
+  return {
+    buzon: path.resolve(ctx.directory, process.env.BUZON_DIR ?? "fixtures/reto-02/buzon"),
+    maestroOriginal: path.join(fixtures, "maestro-contratos.csv"),
+    comerciales: path.join(fixtures, "comerciales.json"),
+    out,
+    sharepoint,
+    maestro: path.join(sharepoint, "maestro-contratos.csv"),
+    historial: path.join(sharepoint, "historial.jsonl"),
+    procesados: path.join(out, "procesados.json"),
+    alertas: path.join(out, "alertas.md"),
+  };
+}
+
+// ── CSV (RFC 4180): todo se lee como texto para no perder ceros a la izquierda ──
+
+/** Parsea un CSV con comillas, comas y saltos de línea dentro de los campos. */
+export function parsearCsv(texto: string): string[][] {
+  const registros: string[][] = [];
+  let campo = "";
+  let fila: string[] = [];
+  let entreComillas = false;
+  for (let i = 0; i < texto.length; i++) {
+    const c = texto[i];
+    if (entreComillas) {
+      if (c === '"' && texto[i + 1] === '"') { campo += '"'; i++; }
+      else if (c === '"') entreComillas = false;
+      else campo += c;
+    } else if (c === '"') entreComillas = true;
+    else if (c === ",") { fila.push(campo); campo = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && texto[i + 1] === "\n") i++;
+      fila.push(campo); campo = "";
+      registros.push(fila); fila = [];
+    } else campo += c;
+  }
+  if (campo !== "" || fila.length > 0) { fila.push(campo); registros.push(fila); }
+  return registros;
+}
+
+/** Serializa con comillas solo donde hacen falta, LF y salto final. */
+export function serializarCsv(registros: string[][]): string {
+  const celda = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+  return registros.map((r) => r.map(celda).join(",")).join("\n") + "\n";
+}
+
+// ── Maestro: el fixture es de solo lectura; se trabaja sobre la copia en out/ (RN6) ──
+
+/** Lee la copia del maestro en `out/sharepoint/`, creándola desde el fixture la primera vez (RN6). */
+export function leerMaestro(ctx: Contexto): FilaMaestro[] {
+  const r = rutas(ctx);
+  if (!fs.existsSync(r.maestro)) {
+    fs.mkdirSync(r.sharepoint, { recursive: true });
+    fs.copyFileSync(r.maestroOriginal, r.maestro);
+  }
+  const [cabecera, ...filas] = parsearCsv(fs.readFileSync(r.maestro, "utf8"));
+  if (cabecera.join(",") !== COLUMNAS_MAESTRO.join(",")) throw new Error("el maestro no tiene las columnas esperadas (PRD §7.2)");
+  return filas.map((f) => Object.fromEntries(COLUMNAS_MAESTRO.map((c, i) => [c, f[i] ?? ""])) as FilaMaestro);
+}
+
+/** Reescribe la copia del maestro conservando encabezado y orden de columnas. */
+export function escribirMaestro(ctx: Contexto, filas: FilaMaestro[]): void {
+  const registros = [[...COLUMNAS_MAESTRO], ...filas.map((f) => COLUMNAS_MAESTRO.map((c) => f[c]))];
+  fs.writeFileSync(rutas(ctx).maestro, serializarCsv(registros));
+}
+
+/** Borra `out/` completo (demo y reinicio). Se niega a borrar fuera del proyecto. */
+export function limpiarSalida(ctx: Contexto): void {
+  const out = rutas(ctx).out;
+  if (!out.startsWith(path.resolve(ctx.directory) + path.sep)) throw new Error("OUT_DIR debe estar dentro del proyecto");
+  fs.rmSync(out, { recursive: true, force: true });
+}
+
+// ── Procesados, historial y archivo ──
+
+export interface Procesado {
+  accion: string;
+  id_contrato: string | null;
+  ts: string;
+}
+
+/** Mensajes ya procesados (HU-1): `{ [mensaje_id]: { accion, id_contrato, ts } }`. */
+export function leerProcesados(ctx: Contexto): Record<string, Procesado> {
+  const p = rutas(ctx).procesados;
+  return fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, Procesado>) : {};
+}
+
+/** Marca un mensaje como procesado para que no vuelva a aparecer en el buzón (HU-4). */
+export function marcarProcesado(ctx: Contexto, mensajeId: string, accion: string, idContrato: string | null): void {
+  const todos = leerProcesados(ctx);
+  todos[mensajeId] = { accion, id_contrato: idContrato, ts: new Date().toISOString() };
+  fs.mkdirSync(rutas(ctx).out, { recursive: true });
+  fs.writeFileSync(rutas(ctx).procesados, JSON.stringify(todos, null, 2) + "\n");
+}
+
+/** Agrega `{ ts, id_contrato, accion, cambios, mensaje_id }` a `historial.jsonl` (HU-4, O2). */
+export function anotarHistorial(ctx: Contexto, entrada: { id_contrato: string; accion: string; cambios: unknown; mensaje_id: string }): void {
+  fs.mkdirSync(rutas(ctx).sharepoint, { recursive: true });
+  const linea = { ts: new Date().toISOString(), ...entrada };
+  fs.appendFileSync(rutas(ctx).historial, JSON.stringify(linea) + "\n");
+}
+
+/** Copia un adjunto a `out/sharepoint/<relativa>` y devuelve la ruta relativa que se guarda en el maestro. */
+export function archivar(ctx: Contexto, origen: string, relativa: string): string {
+  const destino = path.join(rutas(ctx).sharepoint, relativa);
+  fs.mkdirSync(path.dirname(destino), { recursive: true });
+  fs.copyFileSync(origen, destino);
+  return relativa;
+}
+
+// ── Buzón y catálogo de comerciales (todo JSON externo pasa por zod) ──
+
+const Correo = z.object({
+  id: z.string(),
+  de: z.string(),
+  para: z.string(),
+  asunto: z.string(),
+  fecha: z.string(),
+  cuerpo: z.string(),
+  adjuntos: z.array(z.string()),
+});
+export type Correo = z.infer<typeof Correo>;
+
+const Comerciales = z.array(z.object({ email: z.string(), nombre: z.string(), region: z.string() }));
+export type Comercial = z.infer<typeof Comerciales>[number];
+
+/** Ids de los mensajes del buzón, en orden. */
+export function listarMensajes(ctx: Contexto): string[] {
+  const dir = rutas(ctx).buzon;
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+}
+
+/** Valida que el id exista en el buzón; impide rutas como `../../.env`. */
+export function carpetaMensaje(ctx: Contexto, mensajeId: string): string {
+  if (!/^[\w-]+$/.test(mensajeId) || !listarMensajes(ctx).includes(mensajeId)) {
+    throw new Error(`el mensaje ${mensajeId} no existe en el buzón`);
+  }
+  return path.join(rutas(ctx).buzon, mensajeId);
+}
+
+/** Lee y valida `correo.json` de un mensaje. */
+export function leerCorreo(ctx: Contexto, mensajeId: string): Correo {
+  const crudo = JSON.parse(fs.readFileSync(path.join(carpetaMensaje(ctx, mensajeId), "correo.json"), "utf8"));
+  return Correo.parse(crudo);
+}
+
+/** Ruta de un adjunto declarado en el correo (solo nombres simples, sin subcarpetas). */
+export function rutaAdjunto(ctx: Contexto, mensajeId: string, nombre: string): string {
+  if (nombre !== path.basename(nombre)) throw new Error(`adjunto inválido: ${nombre}`);
+  return path.join(carpetaMensaje(ctx, mensajeId), nombre);
+}
+
+/** Catálogo de comerciales validado. */
+export function leerComerciales(ctx: Contexto): Comercial[] {
+  return Comerciales.parse(JSON.parse(fs.readFileSync(rutas(ctx).comerciales, "utf8")));
+}

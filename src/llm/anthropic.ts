@@ -25,6 +25,9 @@ const FINES: Partial<Record<string, Fin>> = {
   refusal: "rechazo",
 };
 
+/** CA5: qué falta y cómo seguir, sin llamar al proveedor. */
+export const SIN_CLAVE = "Falta ANTHROPIC_API_KEY en el backend; configúrala o usa LLM_PROVEEDOR=simulado.";
+
 const leerEsfuerzo = (valor: string | undefined): Esfuerzo => ESFUERZOS.find((e) => e === valor) ?? "low";
 const leerNumero = (valor: string | undefined, porDefecto: number): number => (Number(valor) > 0 ? Number(valor) : porDefecto);
 
@@ -37,16 +40,20 @@ export class AdaptadorAnthropic implements AdaptadorLlm {
   readonly #cliente: Anthropic;
   // Si la cuenta no admite el respaldo del servidor, se recuerda para no pagar un 400 en cada llamada.
   private conRespaldo = true;
+  // Sin clave el SDK lanza un Error plano que acabaría como «Error inesperado»; se avisa antes de llamar (CA5).
+  private readonly sinClave: boolean;
 
   /** Lee `LLM_MODELO`, `LLM_ESFUERZO`, `LLM_TIMEOUT_MS` y la clave del entorno del backend (PRD §8); nunca abre `.env`. */
   constructor(entorno: NodeJS.ProcessEnv = process.env) {
     this.modelo = entorno.LLM_MODELO || "claude-opus-5-5";
     this.esfuerzo = leerEsfuerzo(entorno.LLM_ESFUERZO);
+    this.sinClave = !entorno.ANTHROPIC_API_KEY?.trim();
     this.#cliente = new Anthropic({ apiKey: entorno.ANTHROPIC_API_KEY, timeout: leerNumero(entorno.LLM_TIMEOUT_MS, 90_000), maxRetries: 1 });
   }
 
   /** Envía la conversación; reenvía si el proveedor pausa el turno y traduce todo error a `ErrorLlm` (CA5). */
   async enviar(sistema: string, mensajes: Mensaje[], herramientas: DefinicionHerramienta[], opciones: OpcionesEnvio = {}): Promise<Respuesta> {
+    if (this.sinClave) throw new ErrorLlm(SIN_CLAVE);
     const base = this.parametros(sistema, mensajes, herramientas, opciones);
     let historial = base.messages;
     let acumulada: Respuesta | null = null;
@@ -105,8 +112,9 @@ function aMensajeSdk(m: Mensaje): MensajeSdk {
       content: m.resultados.map((r) => ({ type: "tool_result" as const, tool_use_id: r.id, content: r.contenido, is_error: r.esError })),
     };
   }
-  if (Array.isArray(m.crudo)) return { role: "assistant", content: m.crudo as BloqueSdk[] };
-  // Sin crudo (historial de otro proveedor): se reconstruye con texto y llamadas.
+  // Un crudo vacío no se reenvía: la API rechaza con 400 un mensaje del asistente sin contenido (CA5).
+  if (Array.isArray(m.crudo) && m.crudo.length > 0) return { role: "assistant", content: m.crudo as BloqueSdk[] };
+  // Sin crudo (historial de otro proveedor o respuesta vacía): se reconstruye con texto y llamadas.
   const bloques: BloqueSdk[] = m.texto ? [{ type: "text", text: m.texto }] : [];
   for (const l of m.llamadas) bloques.push({ type: "tool_use", id: l.id, name: l.nombre, input: l.argumentos });
   return { role: "assistant", content: bloques.length ? bloques : [{ type: "text", text: "(sin texto)" }] };

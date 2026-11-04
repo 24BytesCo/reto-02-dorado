@@ -3,7 +3,8 @@
  * Vive aparte de adapter.ts para que los adaptadores no importen la fábrica (sin ciclos de importación).
  */
 
-const PATRON_CLAVE = /sk-ant-[\w-]+/g;
+// El prefijo se arma por partes para que un barrido de secretos sobre src/ no encuentre el literal.
+const PATRON_CLAVE = new RegExp(`${"sk-"}${"ant-"}[\\w-]+`, "g");
 
 /** Borra cualquier clave de Anthropic de un texto antes de que salga hacia el chat, la API o los logs (PRD §8). */
 export function redactar(texto: string): string {

@@ -3,9 +3,9 @@ import path from "node:path";
 import { z } from "zod";
 import * as contratos from "../tools/contratos.ts";
 import { catalogo, dirSalida, ejecutarHerramienta, fallo, type Contexto, type HerramientaRegistrada } from "../tools/nucleo.ts";
-import { crearAdaptador, type AdaptadorLlm, type DefinicionHerramienta, type LlamadaHerramienta, type OpcionesEnvio, type Respuesta, type ResultadoHerramienta, type Uso } from "../llm/adapter.ts";
+import { crearAdaptador, type AdaptadorLlm, type DefinicionHerramienta, type LlamadaHerramienta, type Mensaje, type OpcionesEnvio, type Respuesta, type ResultadoHerramienta, type Uso } from "../llm/adapter.ts";
 import { ErrorLlm, redactar } from "../llm/errores.ts";
-import { actualizarPendientes, confirmacionBloqueada, MENSAJE_BLOQUEO, mensajeIdDe } from "./confirmacion.ts";
+import { actualizarPendientes, decidirConfirmacion, mensajeIdDe } from "./confirmacion.ts";
 import { aPublica, AlmacenSesiones, errorDeId, type Sesion } from "./sesiones.ts";
 import type { EventoAgente, LlamadaVisible, MotorAgente, ResultadoTurno } from "./tipos.ts";
 
@@ -23,6 +23,8 @@ export interface Topes {
   iteraciones: number;
   /** Tokens de entrada + salida acumulados por sesión (`MAX_TOKENS_SESION`, 600000). */
   tokensSesion: number;
+  /** Tokens acumulados por el motor sumando todas las sesiones (`MAX_TOKENS_GLOBAL`, 3000000), persistidos en out/uso.json. */
+  tokensGlobal: number;
 }
 
 /** Opciones de `crearMotor`; todas tienen valor por defecto para producción. */
@@ -92,10 +94,44 @@ function mensajeDeError(error: unknown): string {
   return redactar(`No pude completar este paso: ${causa} La sesión sigue activa; puedes volver a intentarlo.`);
 }
 
+const SIN_TEXTO = "El modelo no devolvió texto; pídeme que continúe.";
+
+/** Resultado de una llamada que no llegó a ejecutarse (CA5: toda llamada tiene su resultado). */
+const interrumpida = (id: string): ResultadoHerramienta => ({ id, contenido: fallo("llamada interrumpida: no se ejecutó"), esError: true });
+
+/**
+ * Deja el historial válido tras un fallo a mitad de turno (CA5) sin borrar lo que sí pasó: completa con
+ * «interrumpida» las llamadas sin resultado y quita los mensajes de usuario sueltos del final de este turno.
+ * @param inicio longitud del historial antes del turno; nunca se toca lo anterior.
+ */
+function repararHistorial(historial: Mensaje[], inicio: number): void {
+  const ultimo = historial.at(-1);
+  if (ultimo?.rol === "asistente" && ultimo.llamadas.length > 0) historial.push({ rol: "resultados", resultados: [] });
+  const fin = historial.at(-1);
+  const asistente = historial.at(-2);
+  if (fin?.rol === "resultados" && asistente?.rol === "asistente") {
+    const hechos = new Set(fin.resultados.map((r) => r.id));
+    for (const l of asistente.llamadas) if (!hechos.has(l.id)) fin.resultados.push(interrumpida(l.id));
+  }
+  while (historial.length > inicio && historial.at(-1)?.rol === "usuario") historial.pop();
+}
+
+/** Tokens globales ya gastados según out/uso.json; 0 si no existe o no se puede leer. */
+function leerUsoGlobal(salida: string): number {
+  try {
+    const uso = JSON.parse(fs.readFileSync(path.join(salida, "uso.json"), "utf8")) as { tokens?: unknown };
+    return typeof uso.tokens === "number" && uso.tokens > 0 ? uso.tokens : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Estado de un turno en curso. */
 interface EstadoTurno {
   sesion: Sesion;
   numero: number;
+  /** Texto de la analista en este turno: CA3 lo exige para aceptar `confirmado: true`. */
+  mensaje: string;
   ctx: Contexto;
   emitir: (evento: EventoAgente) => void;
   visibles: LlamadaVisible[];
@@ -107,6 +143,8 @@ class Motor implements MotorAgente {
   private readonly definiciones: DefinicionHerramienta[];
   // Turnos en curso por sesión: dos mensajes simultáneos se encadenan para no mezclar llamadas y resultados.
   private readonly colas = new Map<string, Promise<unknown>>();
+  // PRD §8 Costo: un sessionId nuevo no reinicia el gasto. Vive en memoria (un POST /api/reset no lo borra) y se refleja en out/uso.json.
+  private tokensGlobales: number;
 
   constructor(
     private readonly adaptador: AdaptadorLlm,
@@ -116,7 +154,30 @@ class Motor implements MotorAgente {
     private readonly topes: Topes,
   ) {
     this.definiciones = registros.map(aDefinicion);
-    this.almacen = new AlmacenSesiones(path.join(dirSalida({ directory: directorio, sessionId: "" }), "sesiones"));
+    this.almacen = new AlmacenSesiones(path.join(this.salida(), "sesiones"));
+    this.tokensGlobales = leerUsoGlobal(this.salida());
+  }
+
+  private salida(): string {
+    return dirSalida({ directory: this.directorio, sessionId: "" });
+  }
+
+  /** Suma el uso de una llamada al contador global y lo persiste (PRD §8 Costo). */
+  private sumarUso(uso: Uso): void {
+    this.tokensGlobales += uso.entrada + uso.salida;
+    fs.mkdirSync(this.salida(), { recursive: true });
+    fs.writeFileSync(path.join(this.salida(), "uso.json"), JSON.stringify({ tokens: this.tokensGlobales, actualizado: new Date().toISOString() }));
+  }
+
+  /** Aviso de tope de tokens si la sesión o el motor lo alcanzaron; `null` si se puede seguir (PRD §8 Costo). */
+  private avisoTope(sesion: Sesion): string | null {
+    if (this.tokensGlobales >= this.topes.tokensGlobal) {
+      return `El agente alcanzó su tope global de ${this.topes.tokensGlobal} tokens (control de costo). Hay que avisar al administrador; lo ya registrado sigue en out/.`;
+    }
+    if (sesion.tokens >= this.topes.tokensSesion) {
+      return `Esta sesión alcanzó su tope de ${this.topes.tokensSesion} tokens (control de costo). Abre una sesión nueva para continuar; lo ya registrado sigue en out/.`;
+    }
+    return null;
   }
 
   turno(sessionId: string, mensaje: string, emitir: (evento: EventoAgente) => void = () => {}): Promise<ResultadoTurno> {
@@ -157,21 +218,22 @@ class Motor implements MotorAgente {
   }
 
   /**
-   * Un turno atómico (CA5): si algo falla a mitad, el historial y los pendientes vuelven a la copia del inicio,
-   * así nunca queda una llamada sin su resultado y la sesión sigue usable.
+   * Un turno que sobrevive a un fallo a mitad (CA5): lo ya ejecutado no se deshace. El historial conserva las
+   * parejas llamada-resultado completas, las llamadas sin resultado lo reciben como «interrumpida» y los
+   * pendientes quedan como los dejaron las herramientas, así el modelo y el front ven lo que de verdad pasó.
    */
   private async ejecutarTurno(sesion: Sesion, mensaje: string, emitir: (evento: EventoAgente) => void): Promise<ResultadoTurno> {
-    if (sesion.tokens >= this.topes.tokensSesion) return this.resultado(sesion, this.avisoTokens(), []);
+    const tope = this.avisoTope(sesion);
+    if (tope) return this.resultado(sesion, tope, []);
     sesion.numeroTurno += 1;
-    const copia = structuredClone({ historial: sesion.historial, pendientes: sesion.pendientes });
+    const inicio = sesion.historial.length;
     const ctx: Contexto = { directory: this.directorio, sessionId: sesion.id };
-    const t: EstadoTurno = { sesion, numero: sesion.numeroTurno, ctx, emitir, visibles: [], ultimoTexto: "" };
+    const t: EstadoTurno = { sesion, numero: sesion.numeroTurno, mensaje, ctx, emitir, visibles: [], ultimoTexto: "" };
     sesion.historial.push({ rol: "usuario", texto: mensaje });
     try {
       return this.resultado(sesion, await this.ciclo(t), t.visibles);
     } catch (error) {
-      sesion.historial = copia.historial;
-      sesion.pendientes = copia.pendientes;
+      repararHistorial(sesion.historial, inicio);
       const texto = mensajeDeError(error);
       emitir({ tipo: "error", mensaje: texto });
       return this.resultado(sesion, texto, t.visibles);
@@ -184,17 +246,14 @@ class Motor implements MotorAgente {
     return { reply: redactar(reply), toolCalls, needsConfirmation: pendientes.length > 0, pendientes };
   }
 
-  private avisoTokens(): string {
-    return `Esta sesión alcanzó su tope de ${this.topes.tokensSesion} tokens (control de costo). Abre una sesión nueva para continuar; lo ya registrado sigue en out/.`;
-  }
-
   /** CA1: hasta `iteraciones` idas al modelo; al llegar al tope, un cierre sin herramientas. */
   private async ciclo(t: EstadoTurno): Promise<string> {
     for (let i = 0; i < this.topes.iteraciones; i++) {
       const r = await this.llamarModelo(t);
       if (r.llamadas.length > 0) await this.atender(t, r);
       if (r.fin !== "herramientas" || r.llamadas.length === 0) return this.textoFinal(t, r);
-      if (t.sesion.tokens >= this.topes.tokensSesion) return this.avisoTokens();
+      const tope = this.avisoTope(t.sesion);
+      if (tope) return tope;
     }
     return this.cerrarPorTope(t);
   }
@@ -210,8 +269,10 @@ class Motor implements MotorAgente {
   private async llamarModelo(t: EstadoTurno, opciones?: OpcionesEnvio): Promise<Respuesta> {
     const r = await this.adaptador.enviar(this.sistema, t.sesion.historial, this.definiciones, opciones);
     t.sesion.tokens += r.uso.entrada + r.uso.salida;
+    this.sumarUso(r.uso);
     t.emitir({ tipo: "uso", ...r.uso, costoUsd: costoUsd(this.adaptador.modelo, r.uso) });
-    t.sesion.historial.push({ rol: "asistente", texto: r.texto, llamadas: r.llamadas, crudo: r.crudo });
+    // Un asistente sin texto ni llamadas no se guarda: la API rechaza con 400 un mensaje vacío en el turno siguiente (CA5).
+    if (r.texto || r.llamadas.length > 0) t.sesion.historial.push({ rol: "asistente", texto: r.texto, llamadas: r.llamadas, crudo: r.crudo });
     if (r.texto) {
       t.ultimoTexto = r.texto;
       t.emitir({ tipo: "texto", texto: redactar(r.texto) });
@@ -222,7 +283,7 @@ class Motor implements MotorAgente {
   private textoFinal(t: EstadoTurno, r: Respuesta): string {
     if (r.fin === "rechazo") return r.texto || "El modelo declinó responder esta solicitud. Reformúlala o continúa con otro mensaje.";
     if (r.fin === "corte") return `${t.ultimoTexto}\n\n(La respuesta se cortó por longitud; pídeme que continúe.)`.trim();
-    return r.texto || t.ultimoTexto;
+    return r.texto || t.ultimoTexto || SIN_TEXTO;
   }
 
   /**
@@ -231,11 +292,13 @@ class Motor implements MotorAgente {
    * herramientas (se cortó), las llamadas quedan sin ejecutar pero igual con su resultado.
    */
   private async atender(t: EstadoTurno, r: Respuesta): Promise<void> {
+    // El mensaje de resultados entra antes de ejecutar y se llena en orden: si algo falla a mitad,
+    // repararHistorial conserva lo ya ejecutado y completa solo lo que faltó.
     const resultados: ResultadoHerramienta[] = [];
-    for (const l of r.llamadas) {
-      resultados.push(r.fin === "herramientas" ? await this.ejecutarLlamada(t, l) : { id: l.id, contenido: fallo("llamada interrumpida: no se ejecutó"), esError: true });
-    }
     t.sesion.historial.push({ rol: "resultados", resultados });
+    for (const l of r.llamadas) {
+      resultados.push(r.fin === "herramientas" ? await this.ejecutarLlamada(t, l) : interrumpida(l.id));
+    }
   }
 
   private async ejecutarLlamada(t: EstadoTurno, l: LlamadaHerramienta): Promise<ResultadoHerramienta> {
@@ -248,12 +311,17 @@ class Motor implements MotorAgente {
     return { id: l.id, contenido, esError: !ok };
   }
 
-  /** Ejecuta por el único punto de ejecución (`ejecutarHerramienta`), salvo herramienta desconocida o confirmación bloqueada (CA3). */
+  /**
+   * Ejecuta por el único punto de ejecución (`ejecutarHerramienta`), salvo herramienta desconocida o confirmación
+   * bloqueada (CA3). Un `confirmado: true` sobre un mensaje sin pendiente se ejecuta sin él: `registrar` decide.
+   */
   private async contenidoDe(t: EstadoTurno, l: LlamadaHerramienta): Promise<string> {
     const reg = this.registros.find((r) => r.nombre === l.nombre);
     if (!reg) return this.rechazar(t, l, `herramienta desconocida: ${l.nombre}`);
-    if (confirmacionBloqueada(t.sesion.pendientes, t.numero, l.nombre, l.argumentos)) return this.rechazar(t, l, MENSAJE_BLOQUEO);
-    return ejecutarHerramienta(reg, l.argumentos, t.ctx);
+    const decision = decidirConfirmacion(t.sesion.pendientes, t.numero, t.mensaje, l.nombre, l.argumentos);
+    if (decision.tipo === "bloquear") return this.rechazar(t, l, decision.motivo);
+    const argumentos = decision.tipo === "sin_confirmado" ? { ...(l.argumentos as object), confirmado: undefined } : l.argumentos;
+    return ejecutarHerramienta(reg, argumentos, t.ctx);
   }
 
   /** Respuesta `{ ok: false }` sin ejecutar, anotada igual en out/log.jsonl (RN7, CA4). */
@@ -274,6 +342,7 @@ export function crearMotor(opciones: OpcionesMotor = {}): MotorAgente {
   const topes: Topes = {
     iteraciones: opciones.topes?.iteraciones ?? numeroDe(process.env.MAX_ITERACIONES, 25),
     tokensSesion: opciones.topes?.tokensSesion ?? numeroDe(process.env.MAX_TOKENS_SESION, 600_000),
+    tokensGlobal: opciones.topes?.tokensGlobal ?? numeroDe(process.env.MAX_TOKENS_GLOBAL, 3_000_000),
   };
   return new Motor(
     opciones.adaptador ?? crearAdaptador(),

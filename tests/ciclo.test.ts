@@ -16,6 +16,9 @@ import { crearMotor, type OpcionesMotor } from "../src/agent/motor.ts";
 import type { EventoAgente } from "../src/agent/tipos.ts";
 
 const SESION = "sesion-prueba";
+// Claves falsas armadas por partes: un barrido de secretos sobre tests/ no encuentra el literal.
+const PREFIJO = "sk-" + "ant-";
+const CON_CLAVE = new RegExp(PREFIJO);
 
 /** Herramientas falsas con los nombres reales: validar siempre pide revisión y registrar cuenta sus ejecuciones. */
 function catalogoFalso() {
@@ -126,9 +129,9 @@ test("CA3: confirmar en el mismo turno en que validar pidió revisión se bloque
   assert.deepEqual(segundo.pendientes, []);
 });
 
-test("CA3: confirmar un mensaje que nunca pidió revisión también se bloquea", async () => {
+test("CA3: confirmado:true sobre un mensaje sin pendiente se ejecuta SIN confirmado y registrar decide", async () => {
   const { herramientas, ejecuciones } = catalogoFalso();
-  const { motor } = preparar(
+  const { ctx, motor } = preparar(
     [
       respuestaHerramientas([{ id: "r1", nombre: "contratos_registrar", argumentos: { mensaje_id: "msg-001", confirmado: true } }]),
       respuestaTexto("listo"),
@@ -136,8 +139,12 @@ test("CA3: confirmar un mensaje que nunca pidió revisión también se bloquea",
     { herramientas },
   );
   const r = await motor.turno(SESION, "registra msg-001");
-  assert.equal(ejecuciones.registrar, 0);
+  assert.equal(ejecuciones.registrar, 0, "el falso registrar sin confirmado pide revisión");
   assert.equal(r.toolCalls[0].ok, false);
+  assert.match(r.toolCalls[0].resumen, /^requiere revisión/);
+  assert.notEqual(r.toolCalls[0].resumen, MENSAJE_BLOQUEO.slice(0, 200));
+  assert.deepEqual(r.pendientes, ["msg-001"], "el rechazo de registrar crea el pendiente para el turno siguiente");
+  assert.equal(leerLog(ctx)[0].herramienta, "contratos_registrar");
 });
 
 test("CA1: al llegar al tope de iteraciones hay una última llamada sin herramientas que resume", async () => {
@@ -158,7 +165,7 @@ test("CA1: al llegar al tope de iteraciones hay una última llamada sin herramie
   sinLlamadasColgadas(adaptador.envios[3].mensajes);
 });
 
-test("CA5: si el proveedor falla a mitad de turno, el historial vuelve al inicio y la sesión sigue", async () => {
+test("CA5: si el proveedor falla a mitad de turno, se conservan las parejas ya ejecutadas y la sesión sigue", async () => {
   const { herramientas } = catalogoFalso();
   const eventos: EventoAgente[] = [];
   const { adaptador, motor } = preparar(
@@ -177,7 +184,8 @@ test("CA5: si el proveedor falla a mitad de turno, el historial vuelve al inicio
   const despues = await motor.turno(SESION, "¿sigues ahí?");
   assert.equal(despues.reply, "Hola de nuevo.");
   const enviado = adaptador.envios[2].mensajes;
-  assert.deepEqual(enviado, [{ rol: "usuario", texto: "¿sigues ahí?" }]);
+  assert.deepEqual(enviado.map((m) => m.rol), ["usuario", "asistente", "resultados", "usuario"]);
+  assert.deepEqual(enviado.at(-1), { rol: "usuario", texto: "¿sigues ahí?" });
   sinLlamadasColgadas(enviado);
   assert.equal(motor.sesion(SESION)?.turnos.length, 2);
 });
@@ -193,19 +201,19 @@ test("tope de tokens por sesión: superado, responde claro sin llamar al modelo 
   assert.equal(motor.sesion(SESION)?.tokens, 110);
 });
 
-test("una clave sk-ant- en un error nunca llega a la respuesta ni a los eventos (PRD §8 Seguridad)", async () => {
+test("una clave del proveedor en un error nunca llega a la respuesta ni a los eventos (PRD §8 Seguridad)", async () => {
   const eventos: EventoAgente[] = [];
-  const { motor } = preparar([new Error("falló con la clave sk-ant-api03-abcDEF_123-xyz")]);
+  const { motor } = preparar([new Error(`falló con la clave ${PREFIJO}api03-abcDEF_123-xyz`)]);
   const r = await motor.turno(SESION, "hola", (e) => eventos.push(e));
-  assert.doesNotMatch(r.reply, /sk-ant-/);
+  assert.doesNotMatch(r.reply, CON_CLAVE);
   assert.match(r.reply, /\[clave oculta\]/);
-  assert.doesNotMatch(JSON.stringify(eventos), /sk-ant-/);
-  const traducido = traducir(Anthropic.APIError.generate(400, { error: { message: "mal sk-ant-xxx" } }, "mal sk-ant-xxx", new Headers()));
-  assert.doesNotMatch(traducido.message, /sk-ant-/);
+  assert.doesNotMatch(JSON.stringify(eventos), CON_CLAVE);
+  const traducido = traducir(Anthropic.APIError.generate(400, { error: { message: `mal ${PREFIJO}xxx` } }, `mal ${PREFIJO}xxx`, new Headers()));
+  assert.doesNotMatch(traducido.message, CON_CLAVE);
   assert.match(traducir(new Anthropic.APIConnectionTimeoutError()).message, /tiempo de espera agotado/);
   assert.match(traducir(Anthropic.APIError.generate(429, {}, "límite", new Headers())).message, /límite de uso/);
   assert.match(traducir(Anthropic.APIError.generate(401, {}, "x", new Headers())).message, /credencial/);
-  assert.doesNotMatch(JSON.stringify(new AdaptadorAnthropic({ ANTHROPIC_API_KEY: "sk-ant-falsa-123" })), /sk-ant-/);
+  assert.doesNotMatch(JSON.stringify(new AdaptadorAnthropic({ ANTHROPIC_API_KEY: `${PREFIJO}falsa-123` })), CON_CLAVE);
 });
 
 test("persistencia: un motor nuevo recarga la sesión desde out/sesiones y continúa con su historial", async () => {

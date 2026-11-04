@@ -7,6 +7,7 @@ import {
 import { CAMPOS_CON_CONFIANZA, REGLAS, type FilaMaestro } from "./reglas.ts";
 import { slugCliente } from "./extraccion.ts";
 import { adjuntoContractual, extraccionDeMensaje, motivoSinContrato, type ExtraccionMensaje } from "./mensajes.ts";
+import { argsAlertas, generarAlertas } from "./alertas.ts";
 import {
   clasificar, confirmadosDe, esquemaContratoCorregido, rechazo, validarCorregido, type ContratoCorregido, type ResultadoClasificacion,
 } from "./clasificacion.ts";
@@ -165,4 +166,11 @@ export const registrar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: ty
       const resumen = `${mensaje_id}: ${hecho.accion} ${hecho.id_contrato ?? "sin id"}; ${hecho.ruta_archivo ?? "sin escritura"}`;
       return ok({ ...hecho, resumen });
     }),
+};
+
+/** HU-5: reporte de riesgos en `out/alertas.md`, con la fecha de referencia como argumento para que sea determinista. */
+export const alertas: Herramienta<typeof argsAlertas> = {
+  description: "Genera out/alertas.md con los contratos que vencen en 60 días o menos desde «hoy», las pólizas exigidas que no están vigentes y los contratos registrados desde el corte del 2026-05-30.",
+  args: argsAlertas,
+  execute: ({ hoy }, ctx) => seguro(() => ok(generarAlertas(ctx, hoy))),
 };

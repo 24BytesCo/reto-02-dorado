@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { dirSalida, type Contexto } from "./nucleo.ts";
-import { COLUMNAS_MAESTRO, type FilaMaestro } from "./reglas.ts";
+import { COLUMNAS_MAESTRO, type Columna, type FilaMaestro } from "./reglas.ts";
 
 /** Rutas de entrada (solo lectura) y de salida, resueltas desde `ctx.directory`. */
 export function rutas(ctx: Contexto) {
@@ -68,9 +68,24 @@ export function leerMaestro(ctx: Contexto): FilaMaestro[] {
   return filas.map((f) => Object.fromEntries(COLUMNAS_MAESTRO.map((c, i) => [c, f[i] ?? ""])) as FilaMaestro);
 }
 
-/** Reescribe la copia del maestro conservando encabezado y orden de columnas. */
+const COLUMNAS_TEXTO_LIBRE: readonly Columna[] = ["cliente", "objeto", "tipo_poliza", "comercial"];
+
+/** Antepone un apóstrofo al texto que Excel interpretaría como fórmula (= + - @ tabulador o retorno). */
+function neutralizarFormula(valor: string): string {
+  return /^[=+\-@\t\r]/.test(valor) ? `'${valor}` : valor;
+}
+
+/** Valor de una celda del maestro: las columnas de texto libre vienen del correo y se neutralizan. */
+function celdaMaestro(fila: FilaMaestro, columna: Columna): string {
+  return COLUMNAS_TEXTO_LIBRE.includes(columna) ? neutralizarFormula(fila[columna]) : fila[columna];
+}
+
+/**
+ * Reescribe la copia del maestro conservando encabezado y orden de columnas.
+ * Neutraliza la inyección de fórmulas en las columnas de texto libre (seguridad, PRD §8).
+ */
 export function escribirMaestro(ctx: Contexto, filas: FilaMaestro[]): void {
-  const registros = [[...COLUMNAS_MAESTRO], ...filas.map((f) => COLUMNAS_MAESTRO.map((c) => f[c]))];
+  const registros = [[...COLUMNAS_MAESTRO], ...filas.map((f) => COLUMNAS_MAESTRO.map((c) => celdaMaestro(f, c)))];
   fs.writeFileSync(rutas(ctx).maestro, serializarCsv(registros));
 }
 
@@ -127,10 +142,10 @@ export function archivar(ctx: Contexto, origen: string, relativa: string): strin
 const Correo = z.object({
   id: z.string(),
   de: z.string(),
-  para: z.string(),
+  para: z.string().optional(),
   asunto: z.string(),
   fecha: z.string(),
-  cuerpo: z.string(),
+  cuerpo: z.string().optional(),
   adjuntos: z.array(z.string()),
 });
 export type Correo = z.infer<typeof Correo>;
@@ -153,10 +168,12 @@ export function carpetaMensaje(ctx: Contexto, mensajeId: string): string {
   return path.join(rutas(ctx).buzon, mensajeId);
 }
 
-/** Lee y valida `correo.json` de un mensaje. */
+/** Lee y valida `correo.json` de un mensaje; si no cumple, lanza un error legible sin rutas absolutas. */
 export function leerCorreo(ctx: Contexto, mensajeId: string): Correo {
-  const crudo = JSON.parse(fs.readFileSync(path.join(carpetaMensaje(ctx, mensajeId), "correo.json"), "utf8"));
-  return Correo.parse(crudo);
+  const crudo: unknown = JSON.parse(fs.readFileSync(path.join(carpetaMensaje(ctx, mensajeId), "correo.json"), "utf8"));
+  const r = Correo.safeParse(crudo);
+  if (!r.success) throw new Error(`el correo ${mensajeId} no tiene el formato esperado: ${z.prettifyError(r.error)}`);
+  return r.data;
 }
 
 /** Ruta de un adjunto declarado en el correo (solo nombres simples, sin subcarpetas). */

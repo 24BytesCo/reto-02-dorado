@@ -91,7 +91,16 @@ export async function ejecutarHerramienta(reg: HerramientaRegistrada, entrada: u
   const mensajeId =
     typeof entrada === "object" && entrada !== null && "mensaje_id" in entrada ? String(entrada.mensaje_id) : null;
   const linea = { ts: new Date().toISOString(), herramienta: reg.nombre, mensaje_id: mensajeId, ...resumir(resultado) };
-  fs.mkdirSync(dirSalida(ctx), { recursive: true });
-  fs.appendFileSync(path.join(dirSalida(ctx), "log.jsonl"), JSON.stringify(linea) + "\n");
+  anotarLog(linea, ctx);
   return resultado;
+}
+
+/** Agrega una línea a `out/log.jsonl`; si no se puede escribir avisa por stderr y no tumba la herramienta. */
+function anotarLog(linea: unknown, ctx: Contexto): void {
+  try {
+    fs.mkdirSync(dirSalida(ctx), { recursive: true });
+    fs.appendFileSync(path.join(dirSalida(ctx), "log.jsonl"), JSON.stringify(linea) + "\n");
+  } catch (e) {
+    console.error(`aviso: no se pudo escribir out/log.jsonl: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }

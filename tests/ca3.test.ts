@@ -9,7 +9,7 @@ import type { Mensaje, Respuesta } from "../src/llm/adapter.ts";
 import { AdaptadorAnthropic, SIN_CLAVE } from "../src/llm/anthropic.ts";
 import { ErrorLlm } from "../src/llm/errores.ts";
 import { AdaptadorSimulado, respuestaHerramientas as rh, respuestaTexto as rt, type PasoGuion } from "../src/llm/simulado.ts";
-import { actualizarPendientes, decidirConfirmacion, MENSAJE_BLOQUEO, MENSAJE_SIN_CONFIRMACION, mensajeConfirma, type Pendientes } from "../src/agent/confirmacion.ts";
+import { actualizarPendientes, decidirConfirmacion, MENSAJE_BLOQUEO, MENSAJE_PRECISAR, MENSAJE_SIN_CONFIRMACION, mensajeConfirma, type Pendientes } from "../src/agent/confirmacion.ts";
 import { crearMotor, type OpcionesMotor } from "../src/agent/motor.ts";
 
 /** Pruebas adversarias del ciclo con las herramientas reales: CA3 burlable, rollback, respuesta vacía y topes. */
@@ -127,6 +127,104 @@ test("CA3 en unidad: afirmación sin negación; números sin separadores y fecha
   assert.equal(decidir("confirmo el valor $1.500.000 y fin 31/08/2028", { valor: 1_500_000, fecha_fin: "2028-08-31" }), "ejecutar");
   assert.equal(decidir("confirmo el valor 1.500.000", { valor: 2_500_000 }), "bloquear");
   assert.equal(decidir("confirmo", { valor: 0, fecha_fin: "2027-08-31" }), "ejecutar");
+});
+
+test("CA3 X1: tras «confirmo el valor 0 y la fecha fin 2027-08-31», el año o el día de la fecha no valen como valor", async () => {
+  for (const valor of [2027, 31, 8]) {
+    const { ctx, t2 } = await confirmarEnT2(CONFIRMACION_PRD, { valor, fecha_fin: "2027-08-31" });
+    assert.equal(t2.toolCalls[0].ok, false, `valor ${valor}`);
+    assert.match(t2.toolCalls[0].resumen, /valor/);
+    assert.doesNotMatch(maestro(ctx), /CM-2026-03/);
+  }
+});
+
+test("CA3 X3: un id_contrato tiene que tener forma de id; una palabra del mensaje no basta", () => {
+  const pendientes: Pendientes = { "msg-x": { turno: 1, campos: ["id_contrato"], propuestos: {} } };
+  const decidir = (mensaje: string, id_contrato: string) =>
+    decidirConfirmacion(pendientes, 2, mensaje, "contratos_registrar", { mensaje_id: "msg-x", confirmado: true, contrato: { id_contrato } }).tipo;
+  assert.equal(decidir("Sí, confirmo el registro", "registro"), "bloquear");
+  assert.equal(decidir("confirmo, ponle CT", "CT"), "bloquear");
+  assert.equal(decidir("confirmo, el id es CT-2026-020", "CT-2026-020"), "ejecutar");
+  assert.equal(decidir("confirmo, el id es CT-2026-0201", "CT-2026-020"), "bloquear", "palabra completa, no prefijo");
+});
+
+test("CA3 X4: la negación va ligada al verbo, las preguntas y las delegaciones vagas no confirman", () => {
+  const pasan = ["confirmo el valor 0 y la fecha fin 2027-08-31", "Confirmo, no hay problema", "Sí, confirmo; no cambies nada más", "Sí", "Confirmo el valor 0 y la fecha 2027-08-31, ni más ni menos", "registra msg-006 con valor 0"];
+  const bloquean = [
+    "no confirmo",
+    "No registres nada",
+    "no apruebo",
+    "no lo registres todavía",
+    "todavía lo reviso",
+    "¿Sí registraste msg-001?",
+    "¿Confirmo yo o tú?",
+    "Registra lo que te dé la gana",
+    "procede con lo que quieras",
+    "si quieres lo vemos mañana",
+  ];
+  for (const f of pasan) assert.equal(mensajeConfirma(f), true, f);
+  for (const f of bloquean) assert.equal(mensajeConfirma(f), false, f);
+});
+
+/** msg-007 sin número de contrato (id automático) a partir de msg-001, escrito en el proyecto temporal. */
+function agregarMsg007(ctx: Contexto): void {
+  const buzon = path.join(ctx.directory, "fixtures", "reto-02", "buzon");
+  const carpeta = path.join(buzon, "msg-007");
+  fs.mkdirSync(carpeta, { recursive: true });
+  const texto = fs.readFileSync(path.join(buzon, "msg-001", "contrato.txt"), "utf8")
+    .replace("No. CT-2026-015", "")
+    .replace("INDUSTRIAS DELTA S.A.S., identificada con NIT 890.900.111-4", "ACME ANDINA S.A.S., identificada con NIT 901.234.567-8")
+    .replace("Industrias Delta S.A.S.", "Acme Andina S.A.S.");
+  fs.writeFileSync(path.join(carpeta, "contrato.txt"), texto);
+  const correo = { id: "msg-007", de: "lgomez@periferia-ficticia.com", asunto: "Contrato Acme", fecha: "2026-09-02T10:00:00-05:00", adjuntos: ["contrato.txt"] };
+  fs.writeFileSync(path.join(carpeta, "correo.json"), JSON.stringify(correo));
+}
+
+const VALIDAR_007 = { id: "v7", nombre: "contratos_validar", argumentos: { mensaje_id: "msg-007" } };
+const REGISTRAR_007 = { id: "r7", nombre: "contratos_registrar", argumentos: { mensaje_id: "msg-007", confirmado: true } };
+
+/** T1 valida msg-006 y msg-007 (dos pendientes); T2 el modelo intenta registrar los dos. */
+async function dosPendientes(mensaje: string) {
+  const p = preparar([rh([VALIDAR_006, VALIDAR_007]), rt("¿Confirmas msg-006 y msg-007?"), rh([registrar006({ valor: 0, fecha_fin: "2027-08-31" }), REGISTRAR_007]), rt("fin")]);
+  agregarMsg007(p.ctx);
+  const t1 = await p.motor.turno(SESION, "procesa msg-006 y msg-007");
+  assert.deepEqual(t1.pendientes, ["msg-006", "msg-007"]);
+  return { ...p, t2: await p.motor.turno(SESION, mensaje) };
+}
+
+test("CA3 X2: con dos pendientes, confirmar uno y aplazar el otro registra solo el confirmado", async () => {
+  const { ctx, t2 } = await dosPendientes("Confirmo msg-006: valor 0 y fecha fin 2027-08-31. El msg-007 todavía lo reviso yo.");
+  assert.equal(t2.toolCalls[0].ok, true, t2.toolCalls[0].resumen);
+  assert.equal(t2.toolCalls[1].ok, false);
+  assert.match(maestro(ctx), /CM-2026-03/);
+  assert.doesNotMatch(maestro(ctx), /AUTO-/);
+  assert.deepEqual(t2.pendientes, ["msg-007"]);
+  assert.equal(t2.needsConfirmation, true);
+});
+
+test("CA3 X2: con dos pendientes, un «confirmo» que no nombra mensaje, id ni cliente pide precisar", async () => {
+  const { ctx, t2 } = await dosPendientes("confirmo");
+  assert.deepEqual(t2.toolCalls.map((c) => c.resumen), [MENSAJE_PRECISAR.slice(0, 200), MENSAJE_PRECISAR.slice(0, 200)]);
+  assert.doesNotMatch(maestro(ctx), /CM-2026-03|AUTO-/);
+});
+
+test("CA3 X2: registrar el msg-006 nombrado (o su cliente) no deja al msg-007 como único pendiente confirmado", async () => {
+  for (const mensaje of ["Confirmo msg-006: valor 0 y fecha fin 2027-08-31", "Lo de Distribuidora Caribe lo confirmo: valor 0 y fecha fin 2027-08-31"]) {
+    const { ctx, t2 } = await dosPendientes(mensaje);
+    assert.equal(t2.toolCalls[0].ok, true, t2.toolCalls[0].resumen);
+    assert.equal(t2.toolCalls[1].resumen, MENSAJE_PRECISAR.slice(0, 200), mensaje);
+    assert.match(maestro(ctx), /CM-2026-03/);
+    assert.doesNotMatch(maestro(ctx), /AUTO-/);
+  }
+});
+
+test("S11: needsConfirmation solo en el turno que pregunta; un turno que no toca pendientes no lo reactiva", async () => {
+  const p = preparar([rh([VALIDAR_006]), rt("¿Confirmas valor 0 y fecha fin 2027-08-31?"), rt("Es un contrato marco de Distribuidora Caribe.")]);
+  const t1 = await p.motor.turno(SESION, "procesa msg-006");
+  assert.equal(t1.needsConfirmation, true);
+  const t2 = await p.motor.turno(SESION, "¿de quién es ese contrato?");
+  assert.equal(t2.needsConfirmation, false);
+  assert.deepEqual(t2.pendientes, ["msg-006"], "el pendiente sigue listado");
 });
 
 test("CA5: si el proveedor cae tras registrar, el registro y su resultado quedan en el historial y no hay pendiente falso", async () => {

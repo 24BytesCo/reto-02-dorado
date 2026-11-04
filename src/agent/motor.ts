@@ -5,7 +5,7 @@ import * as contratos from "../tools/contratos.ts";
 import { anotarLog, catalogo, dirSalida, ejecutarHerramienta, fallo, resumir, type Contexto, type HerramientaRegistrada } from "../tools/nucleo.ts";
 import { crearAdaptador, type AdaptadorLlm, type DefinicionHerramienta, type LlamadaHerramienta, type Mensaje, type OpcionesEnvio, type Respuesta, type ResultadoHerramienta, type Uso } from "../llm/adapter.ts";
 import { ErrorLlm, redactar } from "../llm/errores.ts";
-import { actualizarPendientes, decidirConfirmacion, mensajeIdDe } from "./confirmacion.ts";
+import { actualizarPendientes, decidirConfirmacion, mensajeIdDe, type Pendientes } from "./confirmacion.ts";
 import { aPublica, AlmacenSesiones, errorDeId, type Sesion } from "./sesiones.ts";
 import type { EventoAgente, LlamadaVisible, MotorAgente, ResultadoTurno } from "./tipos.ts";
 
@@ -126,6 +126,10 @@ interface EstadoTurno {
   emitir: (evento: EventoAgente) => void;
   visibles: LlamadaVisible[];
   ultimoTexto: string;
+  /** Mensajes del buzón que alguna herramienta tocó en este turno: solo sus pendientes piden confirmación ahora. */
+  tocados: Set<string>;
+  /** Pendientes al empezar el turno (CA3): con varios, la analista tiene que nombrar cada uno que confirma. */
+  alInicio: Pendientes;
 }
 
 class Motor implements MotorAgente {
@@ -225,22 +229,26 @@ class Motor implements MotorAgente {
     sesion.numeroTurno += 1;
     const inicio = sesion.historial.length;
     const ctx: Contexto = { directory: this.directorio, sessionId: sesion.id };
-    const t: EstadoTurno = { sesion, numero: sesion.numeroTurno, mensaje, ctx, emitir, visibles: [], ultimoTexto: "" };
+    const t: EstadoTurno = { sesion, numero: sesion.numeroTurno, mensaje, ctx, emitir, visibles: [], ultimoTexto: "", tocados: new Set(), alInicio: { ...sesion.pendientes } };
     sesion.historial.push({ rol: "usuario", texto: mensaje });
     try {
-      return this.resultado(sesion, await this.ciclo(t), t.visibles);
+      return this.resultado(sesion, await this.ciclo(t), t.visibles, t.tocados);
     } catch (error) {
       repararHistorial(sesion.historial, inicio);
       const texto = mensajeDeError(error);
       emitir({ tipo: "error", mensaje: texto });
-      return this.resultado(sesion, texto, t.visibles);
+      return this.resultado(sesion, texto, t.visibles, t.tocados);
     }
   }
 
-  /** CA3: `needsConfirmation` y `pendientes` salen del estado de la sesión, no de lo que diga el modelo. */
-  private resultado(sesion: Sesion, reply: string, toolCalls: LlamadaVisible[]): ResultadoTurno {
+  /**
+   * CA3: `needsConfirmation` y `pendientes` salen del estado de la sesión, no de lo que diga el modelo.
+   * `needsConfirmation` solo vale en el turno que termina preguntando: quedó un pendiente que este turno creó o
+   * tocó. Un turno posterior que no toca pendientes no lo reactiva; `pendientes` sigue listándolos todos.
+   */
+  private resultado(sesion: Sesion, reply: string, toolCalls: LlamadaVisible[], tocados: ReadonlySet<string> = new Set()): ResultadoTurno {
     const pendientes = Object.keys(sesion.pendientes);
-    return { reply: redactar(reply), toolCalls, needsConfirmation: pendientes.length > 0, pendientes };
+    return { reply: redactar(reply), toolCalls, needsConfirmation: pendientes.some((id) => tocados.has(id)), pendientes };
   }
 
   /** CA1: hasta `iteraciones` idas al modelo; al llegar al tope, un cierre sin herramientas. */
@@ -300,6 +308,8 @@ class Motor implements MotorAgente {
 
   private async ejecutarLlamada(t: EstadoTurno, l: LlamadaHerramienta): Promise<ResultadoHerramienta> {
     t.emitir({ tipo: "herramienta", id: l.id, nombre: l.nombre, argumentos: l.argumentos });
+    const id = mensajeIdDe(l.argumentos);
+    if (id !== null) t.tocados.add(id);
     const contenido = await this.contenidoDe(t, l);
     actualizarPendientes(t.sesion.pendientes, t.numero, l.nombre, l.argumentos, contenido);
     const { ok, resumen } = resumir(contenido);
@@ -315,7 +325,7 @@ class Motor implements MotorAgente {
   private async contenidoDe(t: EstadoTurno, l: LlamadaHerramienta): Promise<string> {
     const reg = this.registros.find((r) => r.nombre === l.nombre);
     if (!reg) return this.rechazar(t, l, `herramienta desconocida: ${l.nombre}`);
-    const decision = decidirConfirmacion(t.sesion.pendientes, t.numero, t.mensaje, l.nombre, l.argumentos);
+    const decision = decidirConfirmacion(t.sesion.pendientes, t.numero, t.mensaje, l.nombre, l.argumentos, t.alInicio);
     if (decision.tipo === "bloquear") return this.rechazar(t, l, decision.motivo);
     const argumentos = decision.tipo === "sin_confirmado" ? { ...(l.argumentos as object), confirmado: undefined } : l.argumentos;
     return ejecutarHerramienta(reg, argumentos, t.ctx);

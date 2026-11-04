@@ -12,6 +12,7 @@
     "start": "tsx src/server.ts",
     "demo": "tsx demo.ts",
     "test": "node --import tsx --test tests/*.test.ts",
+    "modulo": "tsx scripts/generar-modulo.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

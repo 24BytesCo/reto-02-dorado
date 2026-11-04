@@ -28,6 +28,8 @@ export interface ResultadoTurno {
   needsConfirmation: boolean;
   /** Mensajes del buzón que esperan confirmación de la analista. */
   pendientes: string[];
+  /** Lo agrega la API: aviso de uso fuera de propósito, calculado en código, para que el front lo muestre. */
+  aviso?: string;
 }
 
 /** Un turno de la conversación, como lo devuelve `GET /api/sessions/:id`. */

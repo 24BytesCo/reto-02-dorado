@@ -106,6 +106,12 @@ function enviarEvento(res: Response, nombre: string, datos: unknown): void {
 }
 
 /** Resultado de respaldo si el motor llegara a lanzar (su contrato dice que no): la sesión no muere (CA5). */
+/** Aviso previo a la pausa (desde el segundo mensaje seguido sin trabajo): cuántos van y qué pasa al llegar al umbral. */
+function avisoPrevio(seguidos: number, umbral: number, minutosBase: number): string | undefined {
+  if (umbral <= 0 || seguidos < 2 || seguidos >= umbral) return undefined;
+  return `Llevas ${seguidos} de ${umbral} mensajes seguidos fuera del propósito de esta herramienta. Al llegar a ${umbral}, la conexión queda en pausa ${minutosBase} min. Para seguir: procesa el buzón, revisa un contrato o pide las alertas.`;
+}
+
 /** Aviso de la pausa por uso fuera de propósito: explica para qué sirve la herramienta y cuánto falta. */
 function mensajePausa(segundos: number): string {
   const minutos = Math.ceil(segundos / 60);
@@ -128,7 +134,9 @@ async function turnoSeguro(motor: MotorAgente, sessionId: string, message: strin
  * Responde el turno como stream SSE: un evento por cada `EventoAgente`, latido periódico y un `fin` con el resultado.
  * Si el navegador se desconecta, el turno se completa igual y queda en la sesión.
  */
-async function responderStream(res: Response, motor: MotorAgente, sessionId: string, message: string, latidoMs: number): Promise<ResultadoTurno> {
+type Decorar = (resultado: ResultadoTurno) => ResultadoTurno;
+
+async function responderStream(res: Response, motor: MotorAgente, sessionId: string, message: string, latidoMs: number, decorar: Decorar): Promise<ResultadoTurno> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
@@ -139,7 +147,7 @@ async function responderStream(res: Response, motor: MotorAgente, sessionId: str
   escribir(res, ": abierto\n\n");
   const latido = setInterval(() => escribir(res, ": latido\n\n"), latidoMs);
   try {
-    const resultado = await turnoSeguro(motor, sessionId, message, (evento) => enviarEvento(res, evento.tipo, evento));
+    const resultado = decorar(await turnoSeguro(motor, sessionId, message, (evento) => enviarEvento(res, evento.tipo, evento)));
     enviarEvento(res, "fin", resultado);
     return resultado;
   } finally {
@@ -148,8 +156,8 @@ async function responderStream(res: Response, motor: MotorAgente, sessionId: str
   }
 }
 
-async function responderJson(res: Response, motor: MotorAgente, sessionId: string, message: string): Promise<ResultadoTurno> {
-  const resultado = await turnoSeguro(motor, sessionId, message);
+async function responderJson(res: Response, motor: MotorAgente, sessionId: string, message: string, decorar: Decorar): Promise<ResultadoTurno> {
+  const resultado = decorar(await turnoSeguro(motor, sessionId, message));
   res.json(resultado);
   return resultado;
 }
@@ -198,7 +206,14 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   const info = opciones.info ?? infoDeEntorno();
   const latidoMs = opciones.latidoMs ?? LATIDO_MS;
   const limitador = crearLimitador(opciones.limiteTurnosHora ?? LIMITE_TURNOS_HORA, HORA_MS);
-  const enfriamiento = crearEnfriamiento(opciones.enfriamiento ?? { umbral: 0, minutosBase: 1, maximoMinutos: 1 });
+  const configEnfriamiento = opciones.enfriamiento ?? { umbral: 0, minutosBase: 1, maximoMinutos: 1 };
+  const enfriamiento = crearEnfriamiento(configEnfriamiento);
+  // El aviso se decide después del turno, pero se envía dentro del resultado: por eso el enfriamiento se consulta antes de responder.
+  const conAviso = (resultado: ResultadoTurno, ip: string): ResultadoTurno => {
+    const r = enfriamiento.registrar(ip, resultado.toolCalls.length > 0);
+    const aviso = avisoPrevio(r.seguidos, r.umbral, configEnfriamiento.minutosBase);
+    return aviso ? { ...resultado, aviso } : resultado;
+  };
   // Una sesión con turno en curso rechaza otro (409): el motor los encadenaría, pero la analista debe saberlo.
   const enCurso = new Set<string>();
 
@@ -228,8 +243,8 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
     }
     enCurso.add(sessionId);
     try {
-      const resultado = await (pideStream(req) ? responderStream(res, motor, sessionId, message, latidoMs) : responderJson(res, motor, sessionId, message));
-      enfriamiento.registrar(ip, resultado.toolCalls.length > 0);
+      const decorar = (resultado: ResultadoTurno) => conAviso(resultado, ip);
+      await (pideStream(req) ? responderStream(res, motor, sessionId, message, latidoMs, decorar) : responderJson(res, motor, sessionId, message, decorar));
     } finally {
       enCurso.delete(sessionId);
     }

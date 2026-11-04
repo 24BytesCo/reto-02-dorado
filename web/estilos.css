@@ -100,6 +100,7 @@ body {
 .burbuja.agente.pide-confirmacion { border-color: var(--ambar); box-shadow: 0 0 0 1px var(--ambar); }
 .burbuja.error { background: #fdecea; border-color: var(--error); color: #7a1712; }
 .burbuja.sistema { background: transparent; border-style: dashed; color: var(--apagado); }
+.burbuja.aviso { background: #fff7d1; border-color: var(--ambar); color: #3d3200; }
 
 .burbuja p { margin: 0 0 0.6em; }
 .burbuja p:last-child, .burbuja ul:last-child, .burbuja ol:last-child { margin-bottom: 0; }

@@ -304,6 +304,7 @@ function cerrarTurno(turno, resultado) {
     turno.ultimaBurbuja?.classList.add("pide-confirmacion");
     mostrarAviso(resultado.pendientes ?? []);
   }
+  if (resultado.aviso) agregar(crear("div", "burbuja aviso", resultado.aviso));
 }
 
 function alHerramienta(turno, d) {

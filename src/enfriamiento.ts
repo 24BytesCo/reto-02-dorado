@@ -26,10 +26,12 @@ export interface Enfriamiento {
   /** Segundos de pausa que le quedan a la clave; 0 si puede seguir. */
   bloqueo(clave: string): number;
   /**
-   * Registra cómo terminó un turno. Devuelve los segundos de la pausa si este turno la activó; si no, 0.
+   * Registra cómo terminó un turno.
    * @param conTrabajo el agente usó al menos una herramienta en el turno.
+   * @returns `pausa`: segundos de la pausa si este turno la activó (0 si no); `seguidos`: turnos seguidos sin trabajo que
+   * lleva la conexión después de este; `umbral`: cuántos activan la pausa (0 si está desactivada).
    */
-  registrar(clave: string, conTrabajo: boolean): number;
+  registrar(clave: string, conTrabajo: boolean): { pausa: number; seguidos: number; umbral: number };
 }
 
 const MINUTO_MS = 60_000;
@@ -47,20 +49,21 @@ export function crearEnfriamiento(opciones: OpcionesEnfriamiento, ahora: () => n
       return e && e.hasta > t ? Math.ceil((e.hasta - t) / 1000) : 0;
     },
     registrar(clave, conTrabajo) {
-      if (opciones.umbral <= 0) return 0;
+      const umbral = opciones.umbral;
+      if (umbral <= 0) return { pausa: 0, seguidos: 0, umbral: 0 };
       const e = estados.get(clave) ?? { seguidos: 0, nivel: 0, hasta: 0 };
       estados.set(clave, e);
       if (conTrabajo) {
         e.seguidos = 0;
-        return 0;
+        return { pausa: 0, seguidos: 0, umbral };
       }
       e.seguidos += 1;
-      if (e.seguidos < opciones.umbral) return 0;
+      if (e.seguidos < umbral) return { pausa: 0, seguidos: e.seguidos, umbral };
       const minutos = Math.min(opciones.minutosBase * 3 ** e.nivel, opciones.maximoMinutos);
       e.hasta = ahora() + minutos * MINUTO_MS;
       e.nivel += 1;
       e.seguidos = 0;
-      return minutos * 60;
+      return { pausa: minutos * 60, seguidos: umbral, umbral };
     },
   };
 }

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { crearEnfriamiento, enfriamientoDeEntorno } from "../src/enfriamiento.ts";
+import { crearEnfriamiento, enfriamientoDeEntorno, turnoConProposito } from "../src/enfriamiento.ts";
 import { crearApp } from "../src/server.ts";
 import type { MotorAgente, ResultadoTurno } from "../src/agent/tipos.ts";
 import { proyectoTemporal } from "./ayudas.ts";
@@ -45,8 +45,28 @@ test("cada reincidencia triplica la pausa hasta el techo, y cada IP lleva su pro
 test("con umbral 0 queda desactivado, y la configuración se lee del entorno", () => {
   const e = crearEnfriamiento({ ...opciones, umbral: 0 }, () => 0);
   for (let i = 0; i < 10; i++) assert.equal(e.registrar("ip", false).pausa, 0);
-  assert.deepEqual(enfriamientoDeEntorno({}), { umbral: 6, minutosBase: 5, maximoMinutos: 1440 });
+  assert.deepEqual(enfriamientoDeEntorno({}), { umbral: 12, minutosBase: 5, maximoMinutos: 1440 });
   assert.deepEqual(enfriamientoDeEntorno({ ENFRIAMIENTO_UMBRAL: "0" }).umbral, 0);
+});
+
+test("C9: umbral 12 por defecto (también con la variable vacía), 0 con el modo simulado salvo que ENFRIAMIENTO_UMBRAL lo fije", () => {
+  assert.equal(enfriamientoDeEntorno({ ENFRIAMIENTO_UMBRAL: "" }).umbral, 12);
+  assert.equal(enfriamientoDeEntorno({ LLM_PROVEEDOR: "simulado" }).umbral, 0);
+  assert.equal(enfriamientoDeEntorno({ LLM_PROVEEDOR: " Simulado ", ENFRIAMIENTO_UMBRAL: "" }).umbral, 0);
+  assert.equal(enfriamientoDeEntorno({ LLM_PROVEEDOR: "simulado", ENFRIAMIENTO_UMBRAL: "4" }).umbral, 4);
+  assert.deepEqual(enfriamientoDeEntorno({ ENFRIAMIENTO_MINUTOS: "", ENFRIAMIENTO_MAXIMO_MINUTOS: "" }), { umbral: 12, minutosBase: 5, maximoMinutos: 1440 });
+});
+
+test("C9: no cuenta como fuera de propósito un turno con pendientes, que pide confirmación o que habla del dominio", () => {
+  const vacio = { toolCalls: [], pendientes: [], needsConfirmation: false };
+  assert.equal(turnoConProposito("cuéntame un chiste", vacio), false);
+  assert.equal(turnoConProposito("¿y eso?", { ...vacio, pendientes: ["msg-006"] }), true);
+  assert.equal(turnoConProposito("ok", { ...vacio, needsConfirmation: true }), true);
+  assert.equal(turnoConProposito("x", { ...vacio, toolCalls: [{}] }), true);
+  for (const m of ["¿Qué significa estado_poliza pendiente?", "¿Por qué msg-004 es duplicado?", "¿Cuántos hay en el BUZON?",
+    "¿Qué pasa con la póliza?", "¿qué vence en las alertas?", "¿el maestro se toca?", "Registra todo", "Confirmo", "¿cuál es el contrato?"]) {
+    assert.equal(turnoConProposito(m, vacio), true, m);
+  }
 });
 
 /** Motor falso: responde sin herramientas, como un agente que solo conversa. */
@@ -74,6 +94,25 @@ test("la API pone en pausa a la conexión que encadena mensajes fuera de propós
     assert.equal(bloqueada.status, 429);
     assert.equal(bloqueada.headers.get("retry-after"), "300");
     assert.match(((await bloqueada.json()) as { error: string }).error, /solo para el registro de contratos.*en pausa 5 min/);
+  } finally {
+    servidor.close();
+  }
+});
+
+test("C9: preguntas legítimas del dominio sin herramientas no ponen en pausa (la defensa no se bloquea)", async () => {
+  const app = crearApp(motorConversador, proyectoTemporal().directory, { enfriamiento: { umbral: 3, minutosBase: 5, maximoMinutos: 60 } });
+  const servidor = app.listen(0);
+  try {
+    const url = `http://127.0.0.1:${(servidor.address() as AddressInfo).port}/api/chat`;
+    const enviar = (message: string) =>
+      fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: "sesion-dominio", message }) });
+    const preguntas = ["¿Qué significa estado_poliza pendiente?", "¿Por qué msg-004 es duplicado?", "¿Qué hace el maestro?",
+      "¿Dónde queda el otrosí del contrato?", "¿Qué pasa con una póliza vencida?", "¿Cuántas alertas hay?", "Procesa el buzón"];
+    for (const p of preguntas) {
+      const r = await enviar(p);
+      assert.equal(r.status, 200, p);
+      assert.equal(((await r.json()) as { aviso?: string }).aviso, undefined, p);
+    }
   } finally {
     servidor.close();
   }

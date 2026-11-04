@@ -66,7 +66,7 @@ export function catalogo(archivo: string, modulo: Record<string, unknown>): Herr
 
 /** Directorio de salida (`out/`), configurable con `OUT_DIR`. */
 export function dirSalida(ctx: Contexto): string {
-  return path.resolve(ctx.directory, process.env.OUT_DIR ?? "out");
+  return path.resolve(ctx.directory, process.env.OUT_DIR || "out");
 }
 
 /** `ok` y un resumen corto de un resultado de herramienta: el `resumen` que traiga o el inicio del JSON (log y chat). */
@@ -81,6 +81,41 @@ export function resumir(resultado: string): { ok: boolean; resumen: string } {
   }
 }
 
+type IssueZod = z.ZodError["issues"][number];
+
+const TIPOS: Record<string, string> = {
+  string: "texto", number: "número", boolean: "booleano (true o false)", object: "objeto", array: "lista", null: "null", bigint: "número",
+};
+const tipoEs = (t: unknown): string => TIPOS[String(t)] ?? String(t);
+const unidad = (origen: unknown): string => (origen === "string" ? " caracteres" : origen === "array" ? " elementos" : "");
+
+/** Un límite de zod en español: «mínimo 3 caracteres», «mayor que 0». */
+function limite(palabra: "mínimo" | "máximo", valor: unknown, inclusivo: boolean | undefined, origen: unknown): string {
+  const estricto = palabra === "mínimo" ? "mayor que" : "menor que";
+  return `${inclusivo === false ? estricto : palabra} ${String(valor)}${unidad(origen)}`;
+}
+
+/** Traduce un problema de validación de zod; los mensajes propios (`custom`) ya vienen en español. */
+function problemaEnEspanol(i: IssueZod): string {
+  switch (i.code) {
+    case "invalid_type": {
+      const recibido = /received (\w+)/.exec(i.message)?.[1];
+      return recibido === "undefined" ? "es obligatorio" : `se esperaba ${tipoEs(i.expected)} y llegó ${tipoEs(recibido)}`;
+    }
+    case "too_small": return `demasiado pequeño: ${limite("mínimo", i.minimum, i.inclusive, i.origin)}`;
+    case "too_big": return `demasiado grande: ${limite("máximo", i.maximum, i.inclusive, i.origin)}`;
+    case "invalid_format": return `no tiene el formato esperado${"pattern" in i && i.pattern ? ` (${String(i.pattern)})` : ""}`;
+    case "invalid_value": return `valor no admitido; se esperaba uno de: ${i.values.map((v) => JSON.stringify(v)).join(", ")}`;
+    case "unrecognized_keys": return `claves no admitidas: ${i.keys.join(", ")}`;
+    default: return i.message;
+  }
+}
+
+/** Errores de validación de los argumentos en español, uno por campo: «mensaje_id: se esperaba texto y llegó número». */
+export function erroresEnEspanol(error: z.ZodError): string {
+  return error.issues.map((i) => `${i.path.length > 0 ? i.path.join(".") : "argumentos"}: ${problemaEnEspanol(i)}`).join("; ");
+}
+
 /**
  * Único punto de ejecución de herramientas, usado por el agente y por la demo:
  * valida los argumentos con zod antes de ejecutar, nunca lanza y deja una línea en
@@ -91,7 +126,7 @@ export async function ejecutarHerramienta(reg: HerramientaRegistrada, entrada: u
   const validacion = reg.esquema.safeParse(entrada);
   const resultado = validacion.success
     ? await seguro(() => reg.herramienta.execute(validacion.data, ctx))
-    : fallo(`argumentos inválidos para ${reg.nombre}: ${z.prettifyError(validacion.error)}`);
+    : fallo(`argumentos inválidos para ${reg.nombre}: ${erroresEnEspanol(validacion.error)}`);
   const mensajeId =
     typeof entrada === "object" && entrada !== null && "mensaje_id" in entrada ? String(entrada.mensaje_id) : null;
   const linea = { ts: new Date().toISOString(), herramienta: reg.nombre, mensaje_id: mensajeId, ...resumir(resultado) };

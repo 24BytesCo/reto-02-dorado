@@ -1,12 +1,14 @@
+import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { fallo, ok, seguro, type Contexto, type Herramienta } from "./nucleo.ts";
 import {
-  anotarHistorial, archivar, escribirMaestro, leerCorreo, leerMaestro, leerProcesados, listarMensajes, marcarProcesado, rutaAdjunto,
+  anotarHistorial, archivar, esBinario, escribirMaestro, leerCorreo, leerMaestro, leerProcesados, listarMensajes, marcarProcesado,
+  MOTIVO_BINARIO, rutaAdjunto,
 } from "./almacen.ts";
 import { CAMPOS_CON_CONFIANZA, COLUMNAS_MAESTRO, REGLAS, type FilaMaestro } from "./reglas.ts";
-import { slugCliente } from "./extraccion.ts";
-import { adjuntoContractual, errorLegible, extraccionDeMensaje, motivoSinContrato, type ExtraccionMensaje } from "./mensajes.ts";
+import { slugCliente, tipoDocumento } from "./extraccion.ts";
+import { errorLegible, extraccionDeMensaje, motivoSinContrato, type ExtraccionMensaje } from "./mensajes.ts";
 import type { Correo } from "./almacen.ts";
 import { argsAlertas, generarAlertas } from "./alertas.ts";
 import {
@@ -37,6 +39,39 @@ function protegido(args: unknown, ctx: unknown, logica: () => string): Promise<s
   });
 }
 
+// ── Adjuntos: binarios y correos con más de un documento contractual (O1, HU-6) ──
+
+/** Adjuntos de un correo por tipo: los de texto que son documento contractual y los binarios que no se leen. */
+interface InventarioAdjuntos {
+  contractuales: string[];
+  binarios: string[];
+}
+
+/** Clasifica cada adjunto; uno con nombre inválido o que no existe no cuenta (de eso informa `motivoSinContrato`). */
+function inventarioAdjuntos(ctx: Contexto, correo: Correo): InventarioAdjuntos {
+  const inventario: InventarioAdjuntos = { contractuales: [], binarios: [] };
+  for (const nombre of correo.adjuntos) {
+    try {
+      const ruta = rutaAdjunto(ctx, correo.id, nombre);
+      if (esBinario(ruta)) inventario.binarios.push(nombre);
+      else if (tipoDocumento(fs.readFileSync(ruta, "utf8"))) inventario.contractuales.push(nombre);
+    } catch {
+      // Adjunto ilegible: no es contrato ni binario.
+    }
+  }
+  return inventario;
+}
+
+/** Motivo de un correo cuyos únicos candidatos a contrato son binarios: no se leen y quedan pendientes (no rechazados). */
+const motivoBinario = (inv: InventarioAdjuntos): string => `${MOTIVO_BINARIO} (${inv.binarios.join(", ")})`;
+
+/** Aviso si el correo trae otros adjuntos que podrían ser contratos además del que se procesa, o `null`. */
+function avisoAdjuntos(inv: InventarioAdjuntos, usado: string): string | null {
+  const otros = [...inv.contractuales, ...inv.binarios].filter((n) => n !== usado);
+  if (otros.length === 0) return null;
+  return `El correo trae ${otros.length + 1} adjuntos que pueden ser contratos: solo se procesó ${usado}; ${otros.join(", ")} `
+    + "queda sin leer. Confirma con la analista antes de marcar el mensaje como procesado.";
+}
 
 /** HU-2: datos estructurados del contrato adjunto, con confianza por campo. */
 export const extraer: Herramienta<{ mensaje_id: typeof mensajeId }> = {
@@ -45,7 +80,11 @@ export const extraer: Herramienta<{ mensaje_id: typeof mensajeId }> = {
   execute: (args, ctx) =>
     protegido(args, ctx, () => {
       const { mensaje_id } = args;
-      const e = extraccionDeMensaje(ctx, mensaje_id);
+      const inv = inventarioAdjuntos(ctx, leerCorreo(ctx, mensaje_id));
+      if (inv.contractuales.length === 0 && inv.binarios.length > 0) return fallo(`${mensaje_id}: ${motivoBinario(inv)}`);
+      const extraida = extraccionDeMensaje(ctx, mensaje_id);
+      const aviso = avisoAdjuntos(inv, extraida.adjunto);
+      const e = aviso ? { ...extraida, advertencias: [...extraida.advertencias, aviso] } : extraida;
       const bajos = CAMPOS_CON_CONFIANZA.filter((k) => e.contrato[k].valor !== null && e.contrato[k].confianza < REGLAS.umbralConfianza);
       return ok({ ...e, resumen: `${e.contrato.id_contrato.valor ?? "sin id"} (${e.tipo_documento}); confianza baja en: ${bajos.join(", ") || "ninguno"}` });
     }),
@@ -61,13 +100,23 @@ interface MensajeBuzon {
   tiene_contrato: boolean;
   clasificacion?: "rechazado";
   motivo?: string;
+  /** El mensaje no se puede resolver solo (adjunto binario): queda en el buzón para revisión manual. */
+  pendiente?: true;
+  advertencia?: string;
 }
 
-/** Resumen de un correo legible: sin adjunto contractual queda rechazado con motivo (RN4). */
+/**
+ * Resumen de un correo legible: sin adjunto contractual queda rechazado con motivo (RN4); si el único candidato es
+ * binario (PDF, Word), queda pendiente con «formato no soportado: revisión manual»; con varios candidatos, avisa.
+ */
 function resumirCorreo(ctx: Contexto, correo: Correo): MensajeBuzon {
-  const tiene_contrato = adjuntoContractual(ctx, correo) !== null;
+  const inv = inventarioAdjuntos(ctx, correo);
+  const tiene_contrato = inv.contractuales.length > 0;
   const base = { id: correo.id, de: correo.de, asunto: correo.asunto, fecha: correo.fecha, adjuntos: correo.adjuntos, tiene_contrato };
-  return tiene_contrato ? base : { ...base, clasificacion: "rechazado", motivo: motivoSinContrato(ctx, correo) };
+  if (!tiene_contrato && inv.binarios.length > 0) return { ...base, pendiente: true, motivo: motivoBinario(inv) };
+  if (!tiene_contrato) return { ...base, clasificacion: "rechazado", motivo: motivoSinContrato(ctx, correo) };
+  const aviso = avisoAdjuntos(inv, inv.contractuales[0]);
+  return aviso ? { ...base, advertencia: aviso } : base;
 }
 
 /** HU-6: un correo.json roto, incompleto o ausente no tumba el lote; ese mensaje sale rechazado con motivo legible. */
@@ -111,8 +160,11 @@ interface Evaluacion {
 function evaluar(ctx: Contexto, mensaje_id: string, corregido: ContratoCorregido): Evaluacion {
   validarCorregido(corregido);
   const correo = leerCorreo(ctx, mensaje_id);
-  if (!adjuntoContractual(ctx, correo)) return { resultado: rechazo(motivoSinContrato(ctx, correo)), extraccion: null };
+  const inv = inventarioAdjuntos(ctx, correo);
+  const pendienteBinario = { resultado: { ...rechazo(motivoBinario(inv)), pendiente: true }, extraccion: null };
+  if (inv.contractuales.length === 0) return inv.binarios.length > 0 ? pendienteBinario : { resultado: rechazo(motivoSinContrato(ctx, correo)), extraccion: null };
   const extraccion = extraccionDeMensaje(ctx, mensaje_id);
+  if (inv.binarios.includes(extraccion.adjunto)) return pendienteBinario;
   const resultado = clasificar({
     extraccion,
     corregido,
@@ -120,7 +172,13 @@ function evaluar(ctx: Contexto, mensaje_id: string, corregido: ContratoCorregido
     fecha_registro: extraccion.contrato.fecha_registro.valor ?? correo.fecha.slice(0, 10),
     maestro: leerMaestro(ctx),
   });
-  return { resultado, extraccion };
+  return { resultado: conAdjuntosEnRevision(resultado, avisoAdjuntos(inv, extraccion.adjunto)), extraccion };
+}
+
+/** Con otros adjuntos candidatos, `adjuntos` entra a revisión: no se marca procesado sin confirmación (O1, RN5). */
+function conAdjuntosEnRevision(r: ResultadoClasificacion, aviso: string | null): ResultadoClasificacion {
+  if (!aviso || r.clasificacion === "rechazado") return r;
+  return { ...r, requiere_revision: [...r.requiere_revision, "adjuntos"], advertencias: [...r.advertencias, aviso] };
 }
 
 /** Id del contrato al que se refiere el resultado: el existente, el propuesto o ninguno. */
@@ -212,6 +270,22 @@ function mensajeColados(campos: string[]): string {
 }
 
 /**
+ * O2: un mensaje que ya figura en `procesados.json` no se vuelve a escribir. Leer `procesados.json` ANTES de tocar el
+ * maestro también hace que un `procesados.json` dañado falle sin haber escrito nada.
+ */
+function yaProcesado(ctx: Contexto, mensaje_id: string): string | null {
+  const procesados = leerProcesados(ctx);
+  if (!Object.hasOwn(procesados, mensaje_id)) return null;
+  const previo = procesados[mensaje_id];
+  marcarProcesado(ctx, mensaje_id, "duplicado", previo.id_contrato);
+  return ok({
+    id_contrato: previo.id_contrato, accion: "duplicado", ruta_archivo: null, ya_procesado: true,
+    motivo: `el mensaje ya se procesó (${previo.accion}); no se escribe nada`,
+    resumen: `${mensaje_id}: ya procesado (${previo.accion} ${previo.id_contrato ?? "sin id"}); sin cambios`,
+  });
+}
+
+/**
  * HU-4: revalida el mensaje y, si no hay campos en revisión o viene `confirmado: true` (RN5), escribe el maestro,
  * archiva el documento, anota el historial y marca el mensaje como procesado. Es idempotente: repetirlo da duplicado.
  */
@@ -225,6 +299,8 @@ export const registrar: Herramienta<{ mensaje_id: typeof mensajeId; contrato: ty
   execute: (args, ctx) =>
     protegido(args, ctx, () => {
       const { mensaje_id, contrato: corregido, confirmado } = args;
+      const repetido = yaProcesado(ctx, mensaje_id);
+      if (repetido) return repetido;
       const ev = evaluar(ctx, mensaje_id, corregido ?? {});
       const revision = ev.resultado.requiere_revision;
       if (revision.length > 0 && confirmado !== true) return fallo(`requiere revisión: ${revision.join(", ")}`);

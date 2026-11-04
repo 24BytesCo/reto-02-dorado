@@ -1,6 +1,6 @@
 import path from "node:path";
 import express, { type Express, type NextFunction, type Request, type RequestHandler, type Response } from "express";
-import { crearEnfriamiento, enfriamientoDeEntorno, type OpcionesEnfriamiento } from "./enfriamiento.ts";
+import { crearEnfriamiento, enfriamientoDeEntorno, turnoConProposito, type OpcionesEnfriamiento } from "./enfriamiento.ts";
 import { z } from "zod";
 import { crearMotor } from "./agent/motor.ts";
 import { errorDeId } from "./agent/sesiones.ts";
@@ -28,6 +28,9 @@ export interface InfoProveedor {
   provider: string;
   model: string;
 }
+
+/** Commit desplegado (`GIT_SHA`, que fija el Dockerfile con `--build-arg`), o `local` fuera de la imagen: así se ve qué versión corre el link. */
+export const commitDesplegado = (entorno: NodeJS.ProcessEnv = process.env): string => entorno.GIT_SHA?.trim() || "local";
 
 /** Ajustes de `crearApp`; todos tienen valor por defecto para producción y las pruebas los acortan. */
 export interface OpcionesApp {
@@ -193,7 +196,7 @@ function cabecerasDeSeguridad(_req: Request, res: Response, next: NextFunction):
 
 /** `info` de respaldo cuando quien crea la app no lo pasa: lo que dice el entorno (el arranque real pasa el del adaptador). */
 function infoDeEntorno(entorno: NodeJS.ProcessEnv = process.env): InfoProveedor {
-  const provider = (entorno.LLM_PROVEEDOR ?? "anthropic").trim().toLowerCase();
+  const provider = (entorno.LLM_PROVEEDOR || "anthropic").trim().toLowerCase();
   return { provider, model: provider === "simulado" ? "simulado" : entorno.LLM_MODELO || "claude-opus-5-5" };
 }
 
@@ -210,8 +213,8 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   const configEnfriamiento = opciones.enfriamiento ?? { umbral: 0, minutosBase: 1, maximoMinutos: 1 };
   const enfriamiento = crearEnfriamiento(configEnfriamiento);
   // El aviso se decide después del turno, pero se envía dentro del resultado: por eso el enfriamiento se consulta antes de responder.
-  const conAviso = (resultado: ResultadoTurno, ip: string): ResultadoTurno => {
-    const r = enfriamiento.registrar(ip, resultado.toolCalls.length > 0);
+  const conAviso = (resultado: ResultadoTurno, ip: string, mensaje: string): ResultadoTurno => {
+    const r = enfriamiento.registrar(ip, turnoConProposito(mensaje, resultado));
     const aviso = avisoPrevio(r.seguidos, r.umbral, configEnfriamiento.minutosBase);
     return aviso ? { ...resultado, aviso } : resultado;
   };
@@ -244,7 +247,7 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
     }
     enCurso.add(sessionId);
     try {
-      const decorar = (resultado: ResultadoTurno) => conAviso(resultado, ip);
+      const decorar = (resultado: ResultadoTurno) => conAviso(resultado, ip, message);
       await (pideStream(req) ? responderStream(res, motor, sessionId, message, latidoMs, decorar) : responderJson(res, motor, sessionId, message, decorar));
     } finally {
       enCurso.delete(sessionId);
@@ -276,10 +279,15 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   });
   app.use("/api", express.json({ limit: "32kb" }));
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, provider: info.provider, model: info.model });
+    res.json({ ok: true, provider: info.provider, model: info.model, commit: commitDesplegado() });
   });
   app.post("/api/chat", chat);
   app.get("/api/sessions/:id", (req, res) => {
+    const invalido = errorDeId(req.params.id);
+    if (invalido) {
+      res.status(400).json({ error: invalido });
+      return;
+    }
     const sesion = motor.sesion(req.params.id);
     if (sesion) res.json(sesion);
     else res.status(404).json({ error: MENSAJES.sinSesion });
@@ -290,9 +298,11 @@ export function crearApp(motor: MotorAgente, directorio: string, opciones: Opcio
   });
   // `no-transform` en el HTML: Cloudflare no inyecta su script en línea de detección de bots, que la CSP
   // estricta bloquearía (documentación de JavaScript Detections). Así no hace falta abrir 'unsafe-inline'.
+  // `no-cache` también en JS y CSS: tras un despliegue el navegador revalida y no sirve un app.js de hace horas.
   app.use(express.static(DIR_WEB, {
     setHeaders: (res, ruta) => {
       if (ruta.endsWith(".html")) res.setHeader("Cache-Control", "no-cache, no-transform");
+      else if (ruta.endsWith(".js") || ruta.endsWith(".css")) res.setHeader("Cache-Control", "no-cache");
     },
   }));
   app.use(manejarErrores);

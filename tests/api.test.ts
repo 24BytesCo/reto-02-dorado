@@ -114,13 +114,21 @@ async function esperarA(condicion: () => boolean): Promise<void> {
 
 // ── /api/health ──
 
-test("health devuelve solo { ok, provider, model }", async (t) => {
+test("health devuelve solo { ok, provider, model, commit }; commit sale de GIT_SHA o es «local»", async (t) => {
   const ctx = proyectoTemporal();
   const s = await levantar(new MotorFalso(), ctx.directory, { info: { provider: "simulado", model: "modelo-x" } });
-  t.after(s.cerrar);
+  const previo = process.env.GIT_SHA;
+  t.after(() => {
+    if (previo === undefined) delete process.env.GIT_SHA;
+    else process.env.GIT_SHA = previo;
+    return s.cerrar();
+  });
+  delete process.env.GIT_SHA;
   const r = await fetch(`${s.url}/api/health`);
   assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { ok: true, provider: "simulado", model: "modelo-x" });
+  assert.deepEqual(await r.json(), { ok: true, provider: "simulado", model: "modelo-x", commit: "local" });
+  process.env.GIT_SHA = "abc1234";
+  assert.equal(((await (await fetch(`${s.url}/api/health`)).json()) as { commit: string }).commit, "abc1234");
 });
 
 // ── POST /api/chat (JSON) ──
@@ -212,12 +220,15 @@ test("sessions responde 404 antes del primer turno y 200 con el historial despu�
   assert.ok(!("historial" in sesion), "el historial crudo del proveedor no sale por la API");
 });
 
-test("sessions con un id inválido responde 404, no un error de servidor", async (t) => {
+test("sessions con un id inválido responde 400 con el formato esperado, no 404 ni un error de servidor", async (t) => {
   const ctx = proyectoTemporal();
   const s = await levantar(motorSimulado(ctx.directory), ctx.directory);
   t.after(s.cerrar);
-  const r = await fetch(`${s.url}/api/sessions/${encodeURIComponent("../x")}`);
-  assert.equal(r.status, 404);
+  for (const id of ["../x", "abc", "1", "con espacio", "x".repeat(65)]) {
+    const r = await fetch(`${s.url}/api/sessions/${encodeURIComponent(id)}`);
+    assert.equal(r.status, 400, id);
+    assert.match(((await r.json()) as { error: string }).error, /entre 6 y 64 letras, números, guiones o guiones bajos/);
+  }
 });
 
 // ── POST /api/reset ──
@@ -334,7 +345,11 @@ test("sirve web/ como estático y las rutas /api desconocidas responden 404 en J
   assert.equal(inicio.status, 200);
   assert.match(inicio.headers.get("content-type") ?? "", /text\/html/);
   assert.match(await inicio.text(), /Agente de registro de contratos/);
-  assert.equal((await fetch(`${s.url}/app.js`)).status, 200);
+  const js = await fetch(`${s.url}/app.js`);
+  assert.equal(js.status, 200);
+  assert.equal(js.headers.get("cache-control"), "no-cache", "JS sin caché larga: tras desplegar se ve la versión nueva");
+  assert.equal(inicio.headers.get("cache-control"), "no-cache, no-transform");
+  assert.equal((await fetch(`${s.url}/estilos.css`)).headers.get("cache-control"), "no-cache");
   const desconocida = await fetch(`${s.url}/api/no-existe`);
   assert.equal(desconocida.status, 404);
   assert.deepEqual(await desconocida.json(), { error: "Ruta no encontrada." });

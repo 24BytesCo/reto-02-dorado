@@ -10,7 +10,7 @@ export function rutas(ctx: Contexto) {
   const out = dirSalida(ctx);
   const sharepoint = path.join(out, "sharepoint");
   return {
-    buzon: path.resolve(ctx.directory, process.env.BUZON_DIR ?? "fixtures/reto-02/buzon"),
+    buzon: path.resolve(ctx.directory, process.env.BUZON_DIR || "fixtures/reto-02/buzon"),
     maestroOriginal: path.join(fixtures, "maestro-contratos.csv"),
     comerciales: path.join(fixtures, "comerciales.json"),
     out,
@@ -81,12 +81,24 @@ function celdaMaestro(fila: FilaMaestro, columna: Columna): string {
 }
 
 /**
- * Reescribe la copia del maestro conservando encabezado y orden de columnas.
+ * Escribe un archivo de forma atómica (PRD §8 confiabilidad, O2): primero a un temporal en la misma carpeta y luego
+ * `renameSync`, que en el mismo sistema de archivos reemplaza el destino de una vez. Si el proceso muere a mitad,
+ * queda el archivo anterior entero y un `.tmp` huérfano, nunca un maestro o un `procesados.json` a medias.
+ */
+export function escribirAtomico(ruta: string, contenido: string): void {
+  fs.mkdirSync(path.dirname(ruta), { recursive: true });
+  const temporal = `${ruta}.${process.pid}.tmp`;
+  fs.writeFileSync(temporal, contenido);
+  fs.renameSync(temporal, ruta);
+}
+
+/**
+ * Reescribe la copia del maestro conservando encabezado y orden de columnas, de forma atómica (O2).
  * Neutraliza la inyección de fórmulas en las columnas de texto libre (seguridad, PRD §8).
  */
 export function escribirMaestro(ctx: Contexto, filas: FilaMaestro[]): void {
   const registros = [[...COLUMNAS_MAESTRO], ...filas.map((f) => COLUMNAS_MAESTRO.map((c) => celdaMaestro(f, c)))];
-  fs.writeFileSync(rutas(ctx).maestro, serializarCsv(registros));
+  escribirAtomico(rutas(ctx).maestro, serializarCsv(registros));
 }
 
 /**
@@ -102,25 +114,41 @@ export function limpiarSalida(ctx: Contexto): void {
 
 // ── Procesados, historial y archivo ──
 
-/** Entrada de `out/procesados.json`: cómo terminó un mensaje del buzón (HU-1, HU-4). */
+/**
+ * Entrada de `out/procesados.json`: cómo terminó un mensaje del buzón (HU-1, HU-4). `accion`, `id_contrato` y `ts`
+ * son los del primer procesamiento y no se reescriben; `ultima_accion` e `intentos` cuentan los reintentos.
+ */
 export interface Procesado {
   accion: string;
   id_contrato: string | null;
   ts: string;
+  ultima_accion?: string;
+  intentos?: number;
 }
 
-/** Mensajes ya procesados (HU-1): `{ [mensaje_id]: { accion, id_contrato, ts } }`. */
+/** Mensajes ya procesados (HU-1): `{ [mensaje_id]: { accion, id_contrato, ts, ultima_accion, intentos } }`. */
 export function leerProcesados(ctx: Contexto): Record<string, Procesado> {
   const p = rutas(ctx).procesados;
-  return fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, Procesado>) : {};
+  if (!fs.existsSync(p)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, Procesado>;
+  } catch {
+    throw new Error("out/procesados.json está dañado (JSON incompleto): no se escribe nada hasta revisarlo o restaurarlo");
+  }
 }
 
-/** Marca un mensaje como procesado para que no vuelva a aparecer en el buzón (HU-4). */
+/**
+ * Marca un mensaje como procesado para que no vuelva a aparecer en el buzón (HU-4), con escritura atómica (O2).
+ * Un reintento conserva la primera acción (lo que de verdad pasó con el correo) y solo actualiza `ultima_accion`
+ * e `intentos`: re-registrar msg-001 no lo convierte de `nuevo` en `duplicado`.
+ */
 export function marcarProcesado(ctx: Contexto, mensajeId: string, accion: string, idContrato: string | null): void {
   const todos = leerProcesados(ctx);
-  todos[mensajeId] = { accion, id_contrato: idContrato, ts: new Date().toISOString() };
-  fs.mkdirSync(rutas(ctx).out, { recursive: true });
-  fs.writeFileSync(rutas(ctx).procesados, JSON.stringify(todos, null, 2) + "\n");
+  const previo = Object.hasOwn(todos, mensajeId) ? todos[mensajeId] : undefined;
+  todos[mensajeId] = previo
+    ? { ...previo, ultima_accion: accion, intentos: (previo.intentos ?? 1) + 1 }
+    : { accion, id_contrato: idContrato, ts: new Date().toISOString(), ultima_accion: accion, intentos: 1 };
+  escribirAtomico(rutas(ctx).procesados, JSON.stringify(todos, null, 2) + "\n");
 }
 
 /** Agrega `{ ts, id_contrato, accion, cambios, mensaje_id }` a `historial.jsonl` (HU-4, O2). */
@@ -183,6 +211,23 @@ export function leerCorreo(ctx: Contexto, mensajeId: string): Correo {
 export function rutaAdjunto(ctx: Contexto, mensajeId: string, nombre: string): string {
   if (nombre !== path.basename(nombre)) throw new Error(`adjunto inválido: ${nombre}`);
   return path.join(carpetaMensaje(ctx, mensajeId), nombre);
+}
+
+/** Motivo de un adjunto que no es texto plano (PDF, Word, imagen): no se lee y queda para revisión manual (HU-6). */
+export const MOTIVO_BINARIO = "formato no soportado: revisión manual";
+
+/**
+ * `true` si el adjunto no es texto plano: empieza por `%PDF` o trae bytes de control (NUL y similares; tabulador,
+ * saltos de línea y avance de página no cuentan). Un archivo ilegible no es binario: de eso se ocupa quien lo lee.
+ */
+export function esBinario(ruta: string): boolean {
+  try {
+    const bytes = fs.readFileSync(ruta);
+    if (bytes.subarray(0, 4).toString("latin1") === "%PDF") return true;
+    return bytes.some((b) => b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0c && b !== 0x0d);
+  } catch {
+    return false;
+  }
 }
 
 /** Catálogo de comerciales validado. */

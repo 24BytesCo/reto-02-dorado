@@ -74,11 +74,15 @@ export function escribirMaestro(ctx: Contexto, filas: FilaMaestro[]): void {
   fs.writeFileSync(rutas(ctx).maestro, serializarCsv(registros));
 }
 
-/** Borra `out/` completo (demo y reinicio). Se niega a borrar fuera del proyecto. */
+/**
+ * Vacía `out/` (demo y reinicio). Borra el contenido y no la carpeta: en producción `out/` es un
+ * volumen de Docker y borrar el punto de montaje falla con EBUSY. Se niega a operar fuera del proyecto.
+ */
 export function limpiarSalida(ctx: Contexto): void {
   const out = rutas(ctx).out;
   if (!out.startsWith(path.resolve(ctx.directory) + path.sep)) throw new Error("OUT_DIR debe estar dentro del proyecto");
-  fs.rmSync(out, { recursive: true, force: true });
+  if (!fs.existsSync(out)) return;
+  for (const nombre of fs.readdirSync(out)) fs.rmSync(path.join(out, nombre), { recursive: true, force: true });
 }
 
 // ── Procesados, historial y archivo ──
